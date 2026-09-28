@@ -71,16 +71,17 @@ FRAME_SPEED = {
     "SIT": 12, "IDLE": 12, "WALK": 6, "RUN": 4, "SLEEP": 15, "GROOM": 8,
     "STALK": 7, "BLINK": 5, "SWAT": 4, "CLIMB": 5, "DRAG": 6, "FALL": 4,
     "PERCH": 12, "PAT": 3, "SPOOK": 4, "JUMP": 5, "POUNCE": 3, "CHASE": 4,
+    "LEAP": 6,
 }
 
 # ---- State durations, in ticks (20 ticks = 1s)
 STATE_MIN_DURATION = {
     "SIT": 60, "IDLE": 60, "WALK": 40, "GROOM": 60, "SLEEP": 200,
-    "STALK": 60, "BLINK": 6, "SWAT": 20, "PERCH": 80,
+    "STALK": 60, "BLINK": 6, "SWAT": 20, "PERCH": 40,
 }
 STATE_MAX_DURATION = {
-    "SIT": 160, "IDLE": 160, "WALK": 100, "GROOM": 100, "SLEEP": 300,
-    "STALK": 120, "RUN": 90, "PERCH": 200,
+    "SIT": 110, "IDLE": 110, "WALK": 100, "GROOM": 100, "SLEEP": 300,
+    "STALK": 120, "RUN": 90, "PERCH": 120,
 }
 
 # Transitions are only rolled on this interval, so the pet is calm rather than
@@ -92,8 +93,28 @@ GRAVITY = 0.8          # px/tick^2
 TERMINAL_VEL = 12.0    # px/tick
 CLIMB_SPEED = 2.5      # px/tick upward (50 px/s)
 CLIMB_GRACE_TICKS = 30  # added to the computed budget before giving up
-JUMP_VELOCITY = 7.5    # px/tick upward when leaping off something
+JUMP_VELOCITY = 7.5    # px/tick upward for a playful hop in place
 CHASE_SPEED = 3.4      # px/tick while chasing the cursor
+
+# Leaping. A hop straight up only clears ~35px, which is not enough to reach any
+# window titlebar, so the pet launches itself ballistically at whatever it
+# decided it wanted.
+#
+# The leap gets its own gravity and no terminal-velocity clamp, so the arc is a
+# clean parabola that can be solved for exactly: the pet lands on the titlebar
+# it aimed at instead of wherever the integrator happens to end up. These bound
+# how far it will commit to one jump.
+LEAP_GRAVITY = 3.0      # px/tick^2, snappier than falling
+LEAP_ARC = 1.35        # apex overshoot: the arc has to clear the target and
+                       # come back down onto it, not graze it at the top
+LEAP_MAX_RISE = 820.0   # px above the pet: a full-height window from the floor
+LEAP_MAX_REACH = 520.0  # px horizontally from the pet's centre
+LEAP_VX_MAX = 9.0       # px/tick horizontal cap
+LEAP_AIR_DRAG = 0.985   # horizontal bleed while airborne
+LEAP_MAX_TICKS = 140    # ~7s: past this the leap has clearly missed
+LEAP_GOAL_WALK = 900.0  # how far the pet will walk to line up under a window
+LEAP_GOAL_SPEED = 1.7   # px/tick while heading for a goal, vs 1.1 ambling
+LEAP_GOAL_MAX_TICKS = 320
 
 # Energy: drained by exertion, restored by rest. Drives the pet's mood and how
 # likely it is to nap instead of playing.
@@ -140,6 +161,10 @@ SPEECH_MIN_WIDTH = 60
 SPEECH_MAX_WIDTH = 220
 SPEECH_DISPLAY_TICKS = 80  # 4 seconds
 SPEECH_MAX_CHARS = 120
+
+# How long after a context menu closes before a "Look At This" capture fires.
+# Long enough for the menu to be unmapped and its shadow to disappear.
+MENU_CLOSE_DELAY_MS = 450
 
 
 # =====================================================================
@@ -397,6 +422,16 @@ class DesktopPet(QWidget):
 
         # ---- physics / FSM ----
         self.vy = 0.0
+        self.vx = 0.0            # horizontal velocity, airborne only
+        self.land_event = None   # what to say when this landing happens
+        self.goal_ledge = None   # the window titlebar the pet is heading for
+        self.leap_target = None  # the titlebar the current leap is aiming at
+        self.leap_y0 = self.leap_x0 = 0.0
+        self.leap_vy0 = self.leap_vx0 = 0.0
+        self.leap_t = 0.0
+        # Recently visited titlebars, so the pet tours the desktop instead of
+        # ping-ponging between the same two windows forever.
+        self.recent_ledges = []
         self.facing = 1
         self.state = "SIT"
         self.state_timer = 0
@@ -468,6 +503,7 @@ class DesktopPet(QWidget):
 
         # ---- screenshot state ----
         self._screenshot_inflight = False
+        self._pending_capture = False
 
         # ---- focus / pomodoro awareness ----
         focus_cfg = self._settings().get("focus", {})
@@ -729,6 +765,7 @@ class DesktopPet(QWidget):
             "JUMP":   ["walk", "stalk", "climb", "sit"],
             "POUNCE": ["swat", "stalk", "walk", "sit"],
             "CHASE":  ["run", "stalk", "walk", "sit"],
+            "LEAP":   ["climb", "walk", "stalk", "sit"],
         }
         table = {}
         for state, names in fallbacks.items():
@@ -884,8 +921,18 @@ class DesktopPet(QWidget):
             ai_companion.reserve_forced_screenshot()
 
         app = QApplication.instance()
-        image, reason = screen_capture.prepare_capture(
-            app, settings.get("blocklist", []), self.screen_rect)
+        # Hide the pet for the duration of the grab. Its own speech bubble is
+        # not something to send to the model, and the model will happily
+        # comment on the pet commenting on the screen. Unmapping and mapping
+        # back within one event-loop turn costs nothing visible.
+        was_visible = self.isVisible()
+        self.hide()
+        try:
+            image, reason = screen_capture.prepare_capture(
+                app, settings.get("blocklist", []), self.screen_rect)
+        finally:
+            if was_visible:
+                self.show()
         if image is None:
             # Blocked or unavailable: release the slot, and say so once in a
             # while so a refusal is visible rather than mysterious.
@@ -1068,19 +1115,52 @@ class DesktopPet(QWidget):
         except Exception:
             return None
 
+    def _stand_y(self, ledge):
+        """Y for the pet's top-left when sitting on a ledge.
+
+        A titlebar at the very top of the screen would otherwise put the pet
+        half off it, so it is seated no higher than the screen allows.
+        """
+        return max(float(ledge.y) - self.sprite_h, float(self.screen_top))
+
+    def _ledge_at_landing(self, landing_y):
+        """Which titlebar a fall landed on, matched on the landing height.
+
+        Matched on height rather than by the pet's feet, because a pet seated
+        at the top of the screen has its feet *below* the titlebar it is
+        standing on.
+        """
+        for ledge in self._titlebar_ledges():
+            if abs((float(ledge.y) - self.sprite_h) - landing_y) < 2.0:
+                return ledge
+        return None
+
+    def _ledge_exists(self, ledge):
+        """Whether a titlebar is still on the desktop."""
+        if ledge is None:
+            return False
+        for candidate in self._titlebar_ledges():
+            if (candidate.y == ledge.y and candidate.x_min == ledge.x_min
+                    and candidate.x_max == ledge.x_max):
+                return True
+        return False
+
     def _validate_current_ledge(self):
-        """Whether the current ledge is still under the pet."""
+        """Whether the ledge the pet is perched on still exists.
+
+        Identity, not position: a pet seated at the very top of the screen has
+        its feet below the titlebar it is standing on, so "is the pet over the
+        ledge" is the wrong question to ask.
+        """
         if self.current_ledge is None or self.current_ledge.is_floor:
             return True
         if self.tracker is None:
             return False
-        current = self._ledge_under_pet()
-        if current is None:
+        if not self._ledge_exists(self.current_ledge):
             return False
-        # Re-seat on the fresh ledge so a window that moved drags the pet along.
-        if abs(current.y - self.current_ledge.y) > 1 or current.x_min != self.current_ledge.x_min:
-            self.y_pos = float(current.y - self.sprite_h)
-            self.current_ledge = current
+        # Re-seat: a window that moved, or the screen that changed, drags the
+        # pet along instead of leaving it in mid-air.
+        self.y_pos = self._stand_y(self.current_ledge)
         return True
 
     def _clamp_to_ledge(self):
@@ -1112,6 +1192,8 @@ class DesktopPet(QWidget):
     def _enter_fall(self):
         self._enter_state("FALL")
         self.current_ledge = None
+        self.goal_ledge = None
+        self.vx = 0.0
 
     def _enter_sit(self):
         self._enter_state("IDLE" if self.is_ghost else "SIT")
@@ -1189,6 +1271,9 @@ class DesktopPet(QWidget):
             return
         if self.state == "PERCH":
             self._tick_perch(cursor_dx, cursor_dist)
+            return
+        if self.state == "LEAP":
+            self._tick_leap()
             return
         if self.state in ("JUMP", "POUNCE"):
             # Airborne: no ground-lock, no x clamp against the floor, the arc
@@ -1319,11 +1404,283 @@ class DesktopPet(QWidget):
             self._start_jump()
             return
 
+        # Exploring: pick a window and go sit on it. This is what stops the pet
+        # from living on the taskbar for the whole session.
+        threshold += 0.26
+        if roll < threshold and not focusing:
+            if self._start_exploring():
+                return
+
         if force:
             target = self._walk_target()
             if target is not None:
                 self.target_x = target
                 self._enter_state("WALK")
+
+    # ---- LEAP ----------------------------------------------------------
+    #
+    # A hop straight up clears about 35px, which is not enough to reach any
+    # window titlebar, so the pet launches itself ballistically at whatever it
+    # decided it wanted. Without this the pet lives on the taskbar forever: the
+    # only way up was CLIMB, which needs a window border within 35px, and that
+    # almost never happens in the middle of a screen.
+
+    @staticmethod
+    def _goal_anchor(ledge, sprite_w, here):
+        """Where on a ledge the pet aims: the point nearest to it.
+
+        Anchoring on the middle of a titlebar reads as "go to the centre of the
+        screen", which for a maximised window means crossing the whole desktop
+        to reach a window that is directly overhead.
+        """
+        low = ledge.x_min + sprite_w / 2.0
+        high = ledge.x_max - sprite_w / 2.0
+        if high < low:
+            return (ledge.x_min + ledge.x_max) / 2.0
+        return max(low, min(high, here))
+
+    @staticmethod
+    def _leap_drag_adjusted(flight):
+        """Distance one tick of initial vx covers over a whole flight.
+
+        Air bleed means the naive `offset / flight` undershoots badly over a
+        long arc, so the launch velocity has to be scaled up to match.
+        """
+        ticks = max(1, int(round(flight)))
+        travelled = (1.0 - LEAP_AIR_DRAG ** ticks) / (1.0 - LEAP_AIR_DRAG)
+        return max(1.0, travelled)
+
+    def _leap_solution(self, ledge, x=None, y=None, anchor=None):
+        """(vy0, vx, flight) to land on `ledge` from (x, y), or None.
+
+        Solves the parabola for the exact height difference, then scales the
+        horizontal component to compensate for air bleed so the pet arrives where
+        it aimed instead of falling short. It aims at the nearest point on the
+        ledge, not the middle of it: for a maximised window the middle is most
+        of the screen away, which puts the leap over its speed limit and leaves
+        the pet stuck on the taskbar.
+        """
+        if ledge is None or ledge.is_floor:
+            return None
+        x = self.x_pos if x is None else x
+        y = self.y_pos if y is None else y
+        here = x + self.sprite_w / 2.0
+        if anchor is None:
+            anchor = self._goal_anchor(ledge, self.sprite_w, here)
+
+        target_top = float(ledge.y) - self.sprite_h
+        rise = y - target_top
+        if rise <= 2.0:                       # not going up: walk instead
+            return None
+        if rise > LEAP_MAX_RISE:
+            return None
+
+        offset = anchor - here
+        if abs(offset) > LEAP_MAX_REACH:
+            return None
+
+        # Aim the apex LEAP_ARC times the height above the target, so the pet
+        # rises past the titlebar and comes down onto it. A symmetric arc whose
+        # apex is exactly the target only grazes it, with zero vertical speed,
+        # and carries on upward.
+        gravity = LEAP_GRAVITY
+        apex_rise = rise * LEAP_ARC
+        vy0 = math.sqrt(2.0 * gravity * apex_rise)
+        # Time from launch to crossing the target height on the way down.
+        flight = (vy0 + math.sqrt(max(0.0, 2.0 * gravity * rise
+                                      * (LEAP_ARC - 1.0)))) / gravity
+        if flight <= 0 or flight > LEAP_MAX_TICKS:
+            return None
+
+        vx = offset / self._leap_drag_adjusted(flight)
+        if abs(vx) > LEAP_VX_MAX:
+            return None
+        return -vy0, vx, flight
+
+    def _leap_reachable(self, ledge):
+        return self._leap_solution(ledge) is not None
+
+    def _start_leap(self, ledge, anchor=None):
+        """Launch at a titlebar. Returns True if the leap started."""
+        solution = self._leap_solution(ledge, anchor=anchor)
+        if solution is None:
+            return False
+        self.vy, self.vx, _flight = solution
+
+        # The arc is evaluated analytically each tick rather than integrated.
+        # Stepwise integration overshoots the apex by tens of pixels, which made
+        # the pet cross its target height early and land short -- most visibly
+        # when leaping sideways, where "short" means missing the titlebar.
+        self.leap_y0 = self.y_pos
+        self.leap_x0 = self.x_pos
+        self.leap_vy0 = self.vy
+        self.leap_vx0 = self.vx
+        self.leap_t = 0.0
+
+        self.leap_target = ledge
+        self.facing = 1 if self.vx >= 0 else -1
+        self.current_ledge = None
+        self.goal_ledge = None
+        self.land_event = "perch"
+        self._enter_state("LEAP")
+        self._speak_contextual("climb")
+        return True
+
+    def _tick_leap(self):
+        """Advance the arc and decide whether it connected."""
+        self.leap_t += 1.0
+        t = self.leap_t
+        gravity = LEAP_GRAVITY
+
+        self.y_pos = self.leap_y0 + self.leap_vy0 * t + 0.5 * gravity * t * t
+        decay = (1.0 - LEAP_AIR_DRAG ** t) / (1.0 - LEAP_AIR_DRAG)
+        self.x_pos = self.leap_x0 + self.leap_vx0 * decay
+        self.vy = self.leap_vy0 + gravity * t
+        self.vx = 0.0
+
+        target = self.leap_target
+        descending = self.vy > 0
+
+        if target is not None and descending:
+            # The window can close mid-leap. Landing on the stale ledge would
+            # put the pet on a titlebar that no longer exists -- the same class
+            # of bug as entering PERCH without a ledge at all.
+            if not self._ledge_exists(target):
+                self.leap_target = None
+                self.land_event = None
+                self._enter_fall()
+                return
+
+            # Crossing the surface on the way down, while horizontally over it.
+            # Deliberately not "lands exactly on it": at 30+px per frame the
+            # pet steps straight past the surface, and a test that required an
+            # exact hit meant it never landed at all.
+            if self.y_pos + self.sprite_h >= target.y and \
+                    target.holds_any(self.x_pos, self.x_pos + self.sprite_w):
+                self.y_pos = self._stand_y(target)
+                self.vy = self.vx = 0.0
+                self.current_ledge = target
+                self.leap_target = None
+                self.goal_ledge = None
+                self._enter_state("PERCH")
+                self._remember_ledge(target)
+                self._speak_contextual("perch")
+                return
+
+        # Missed, or gave up: fall out of the arc and let the normal landing
+        # logic take over.
+        if (self.y_pos >= self.floor_y
+                or self.state_timer > LEAP_MAX_TICKS
+                or (descending and target is not None
+                    and self.y_pos + self.sprite_h > target.y)):
+            self.leap_target = None
+            self.land_event = None
+            self._enter_fall()
+
+    # ---- Goals ---------------------------------------------------------
+    #
+    # The pet needs a reason to leave the floor. Every so often it picks a
+    # window it wants to be sitting on, walks underneath it, and leaps.
+
+    def _titlebar_ledges(self):
+        """Non-floor ledges, i.e. window titlebars worth visiting."""
+        if self.tracker is None:
+            return []
+        try:
+            return [l for l in self.tracker.get_walkable_ledges(self.screen_rect)
+                    if not l.is_floor and l.width > 20]
+        except Exception:
+            return []
+
+    def _remember_ledge(self, ledge):
+        if ledge is None:
+            return
+        self.recent_ledges = [y for y in self.recent_ledges if y != ledge.y]
+        self.recent_ledges.append(ledge.y)
+        del self.recent_ledges[:-4]
+
+    def _pick_goal_ledge(self):
+        """Choose a titlebar to head for. Returns (ledge, anchor_x).
+
+        A ledge is only a candidate if a leap onto it is solvable from
+        somewhere along the way -- either from here, or after a short walk
+        underneath it. Anything else is not worth committing to.
+        """
+        candidates = []
+        here = self.x_pos + self.sprite_w / 2.0
+        for ledge in self._titlebar_ledges():
+            if self.current_ledge is not None and \
+                    abs(ledge.y - self.current_ledge.y) < 5 and \
+                    ledge.x_min <= here <= ledge.x_max:
+                continue  # already standing on this one
+
+            anchor = self._goal_anchor(ledge, self.sprite_w, here)
+            travel = abs(anchor - here)
+            if travel > LEAP_GOAL_WALK:
+                continue
+            under = anchor - self.sprite_w / 2.0
+            from_here = self._leap_solution(ledge, anchor=anchor) is not None
+            from_under = (self._leap_solution(ledge, x=under, anchor=anchor)
+                          is not None)
+            if not (from_here or from_under):
+                continue
+            candidates.append((0 if from_here else 1, travel, ledge, anchor))
+
+        if not candidates:
+            return None, None
+        # Prefer a leap we can take immediately, then the nearest window, so it
+        # commits to something plausible rather than crossing the desktop.
+        candidates.sort(key=lambda item: (item[0], item[1]))
+        # Keep at least two candidates: with a single one the staleness filter
+        # below has nothing to choose between, and the pet always went to the
+        # same window no matter which ones it had just visited.
+        pool = candidates[:max(2, len(candidates) // 2)]
+
+        # Bias away from titlebars it was just on. Without this it settles into
+        # a two-window loop: up to one, off to the floor, straight back up.
+        def staleness(item):
+            ledge_y = item[2].y
+            for index, seen in enumerate(reversed(self.recent_ledges)):
+                if seen == ledge_y:
+                    return index
+            return len(self.recent_ledges) + 1
+
+        fresh = [item for item in pool if staleness(item) >= 2]
+        if fresh:
+            pool = fresh
+        _immediate, _travel, ledge, anchor = random.choice(pool)
+        return ledge, anchor
+
+    def _start_exploring(self):
+        """Head for a window: leap if it is already in range, else walk under
+        it and leap from there. Returns True if the pet committed to a goal."""
+        ledge, anchor = self._pick_goal_ledge()
+        if ledge is None:
+            return False
+        self.goal_ledge = ledge
+        if self._start_leap(ledge, anchor=anchor):
+            return True
+        # Walk to a spot under the ledge; _tick_walk launches the leap.
+        self.target_x = max(float(self.screen_left),
+                            min(anchor - self.sprite_w / 2.0,
+                                float(self.screen_left + self.screen_w
+                                      - self.sprite_w)))
+        self._enter_state("WALK")
+        return True
+
+    def _maybe_launch_at_goal(self):
+        """Called from WALK: leap once we are standing under the goal."""
+        ledge = self.goal_ledge
+        if ledge is None:
+            return
+        if self._is_on_ledge():
+            self.goal_ledge = None
+            return
+        if not ledge.holds_any(self.x_pos, self.x_pos + self.sprite_w):
+            return
+        anchor = self._goal_anchor(ledge, self.sprite_w,
+                                   self.x_pos + self.sprite_w / 2.0)
+        self._start_leap(ledge, anchor=anchor)
 
     # ---- JUMP ----------------------------------------------------------
 
@@ -1398,17 +1755,33 @@ class DesktopPet(QWidget):
 
     def _tick_walk(self):
         if self.target_x is None:
+            self.goal_ledge = None
             self._enter_sit()
             return
+        self._maybe_launch_at_goal()
+
+        chasing = self.goal_ledge is not None
         dx = self.target_x - self.x_pos
         self.facing = 1 if dx >= 0 else -1
-        self.x_pos += self.facing * 1.1
+        self.x_pos += self.facing * (LEAP_GOAL_SPEED if chasing else 1.1)
 
         if self._clamp_to_ledge():
+            self.goal_ledge = None
             self._enter_sit()
             return
 
-        if abs(dx) < 3 or self.state_timer > STATE_MAX_DURATION.get("WALK", 100):
+        limit = (LEAP_GOAL_MAX_TICKS if chasing
+                 else STATE_MAX_DURATION.get("WALK", 100))
+        if abs(dx) < 3 or self.state_timer > limit:
+            # Standing under the goal but never launched: try once more from
+            # here before giving up, so the pet ends up on the window rather
+            # than parked underneath it.
+            if self.goal_ledge is not None:
+                anchor = self._goal_anchor(self.goal_ledge, self.sprite_w,
+                                           self.x_pos + self.sprite_w / 2.0)
+                if self._start_leap(self.goal_ledge, anchor=anchor):
+                    return
+            self.goal_ledge = None
             self._enter_sit()
 
     # ---- FALL ----------------------------------------------------------
@@ -1416,6 +1789,12 @@ class DesktopPet(QWidget):
     def _tick_fall(self, announce=True):
         self.vy = min(self.vy + GRAVITY, TERMINAL_VEL)
         self.y_pos += self.vy
+        if self.vx:
+            self.x_pos += self.vx
+            # A little bleed so a leap settles instead of sliding forever.
+            self.vx *= LEAP_AIR_DRAG
+            if abs(self.vx) < 0.05:
+                self.vx = 0.0
 
         landing_y = self.floor_y
         if self.tracker is not None:
@@ -1432,10 +1811,15 @@ class DesktopPet(QWidget):
         if self.y_pos >= landing_y:
             self.y_pos = landing_y
             self.vy = 0.0
-            ledge = self._ledge_under_pet() if landing_y < self.floor_y - 5 else None
+            self.vx = 0.0
+            ledge = None
+            if landing_y < self.floor_y - 5:
+                ledge = self._ledge_at_landing(landing_y) or self._ledge_under_pet()
             if ledge is not None:
                 self.current_ledge = ledge
+                self.y_pos = self._stand_y(ledge)
                 self._enter_state("PERCH")
+                self._remember_ledge(ledge)
             else:
                 # Either the floor, or a landing surface we cannot identify.
                 # Never enter PERCH without a ledge: the next tick dereferences
@@ -1443,8 +1827,10 @@ class DesktopPet(QWidget):
                 self.current_ledge = None
                 self.y_pos = self.floor_y
                 self._enter_sit()
-            if announce:
-                self._speak_contextual("drop")
+            event = self.land_event or ("drop" if announce else None)
+            self.land_event = None
+            if event:
+                self._speak_contextual(event)
 
         low = float(self.screen_left)
         high = float(self.screen_left + self.screen_w - self.sprite_w)
@@ -1541,12 +1927,12 @@ class DesktopPet(QWidget):
             return
 
         ledge = self.current_ledge
-        self.y_pos = float(ledge.y - self.sprite_h)
+        self.y_pos = self._stand_y(ledge)
         self.x_pos = max(float(ledge.x_min),
                          min(float(ledge.x_max - self.sprite_w), self.x_pos))
 
-        min_dur = STATE_MIN_DURATION.get("PERCH", 80)
-        max_dur = STATE_MAX_DURATION.get("PERCH", 200)
+        min_dur = STATE_MIN_DURATION.get("PERCH", 40)
+        max_dur = STATE_MAX_DURATION.get("PERCH", 120)
         if self.state_timer < min_dur:
             return
         if (self.state_timer - min_dur) % TRANSITION_EVAL_INTERVAL != 0:
@@ -1556,19 +1942,33 @@ class DesktopPet(QWidget):
         # because 200 ticks is itself one of the evaluated ticks: the pet
         # always left at exactly max_dur and the probability never applied.
         if self.state_timer >= max_dur:
+            # Prefer travelling to another window over stepping off into empty
+            # air; only drop to the floor if nothing else is in reach.
+            if self._start_exploring():
+                return
             self._leave_ledge()
             return
 
         roll = random.random()
+
+        # Hop to another window. This is what turns 'sits on one titlebar'
+        # into 'moves around the desktop': from a perch, leaving was the only
+        # other option, so the pet dropped to the floor and climbed straight
+        # back up to the window it had just left.
+        if roll < 0.30 and self._start_exploring():
+            return
+
         if roll < 0.10:
             span = ledge.x_max - ledge.x_min - self.sprite_w
             if span > 20:
                 self.target_x = random.uniform(ledge.x_min, ledge.x_max - self.sprite_w)
                 self._enter_state("WALK")
                 return
-        elif roll < 0.15:
-            # Sometimes step off rather than dropping: it reads as a decision
-            # rather than a glitch. The arc still ends in _tick_fall.
+
+        # Hopping off, all the way down. The roll above prefers travelling to
+        # another window, but a pet that never comes down still looks stuck up
+        # there, so this stays common on purpose.
+        if roll < 0.55:
             if self.allow_jump and self.energy > 40:
                 self._start_jump()
             else:
@@ -1576,12 +1976,26 @@ class DesktopPet(QWidget):
 
     def _leave_ledge(self):
         self.current_ledge = None
+        self.goal_ledge = None
         self.vy = 0.0
+        self.vx = 0.0
         self._enter_fall()
 
     # =================================================================
     # Painting
     # =================================================================
+
+    def _sprite_offset(self):
+        """Y of the sprite inside its widget.
+
+        The widget is sprite_h + bubble_h tall and the bubble is laid out above
+        the sprite, so with a bubble showing the sprite belongs at the *bottom*.
+        This had it backwards, which drew the sprite underneath the opaque
+        bubble: the pet vanished every time it spoke, at every scale.
+        """
+        if not self.speech_text:
+            return 0
+        return 0 if self.speech_below else self.speech_bubble_h
 
     @guarded
     def paintEvent(self, _event):
@@ -1589,7 +2003,7 @@ class DesktopPet(QWidget):
         painter.setRenderHint(QPainter.Antialiasing, False)
 
         frame = self.get_current_frame()
-        sprite_y = self.sprite_h if self.speech_text and self.speech_below else 0
+        sprite_y = self._sprite_offset()
         if frame is not None:
             painter.drawPixmap(0, sprite_y, frame)
 
@@ -1798,7 +2212,13 @@ class DesktopPet(QWidget):
         quit_action.triggered.connect(self.shutdown)
         menu.addAction(quit_action)
 
+        # The capture cannot happen from inside the menu action: the QMenu is
+        # still on screen, so the model would describe the pet's own menu.
+        # _menu_look only sets the flag; the capture waits for the menu to go.
         menu.exec_(event.globalPos())
+        if self._pending_capture:
+            self._pending_capture = False
+            QTimer.singleShot(MENU_CLOSE_DELAY_MS, self._run_pending_capture)
 
     def _add_toggle(self, menu, label, checked, handler):
         action = QAction(label, self)
@@ -1811,7 +2231,12 @@ class DesktopPet(QWidget):
     # ---- menu actions --------------------------------------------------
 
     def _menu_look(self):
+        """Queue a one-off capture. See contextMenuEvent for the delay."""
         self.heart_timer = 20
+        self._pending_capture = True
+
+    def _run_pending_capture(self):
+        """Fires once the context menu is gone."""
         if self.speech_timer == 0:
             self.speak("one sec, looking.")
         self.maybe_screenshot(force=True)

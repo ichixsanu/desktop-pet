@@ -25,9 +25,19 @@ class TempPaths(unittest.TestCase):
         self._saved = (ai.CONFIG_PATH, ai.MEMORY_PATH, ai.ENV_PATH, ai.CONFIG)
         self.memory_path = os.path.join(self.tmp.name, "memory.json")
         ai.MEMORY_PATH = self.memory_path
+        # Stand in a key. The real .env is deliberately absent from the repo, so
+        # without this every test depending on the AI being configured would
+        # silently exercise the "no key" path instead and pass for the wrong
+        # reason.
+        self._saved_clients = ai._clients
+        self._saved_has_groq = ai._HAS_GROQ
+        ai._clients = [MagicMock()]
+        ai._HAS_GROQ = True
         self.addCleanup(self._restore)
 
     def _restore(self):
+        ai._clients = self._saved_clients
+        ai._HAS_GROQ = self._saved_has_groq
         (ai.CONFIG_PATH, ai.MEMORY_PATH, ai.ENV_PATH,
          ai.CONFIG) = self._saved
         ai.reset_failures()
@@ -35,6 +45,7 @@ class TempPaths(unittest.TestCase):
         ai._sent_log["screenshot"].clear()
         ai._daily.update({"date": "", "count": 0})
         ai._last_capture = 0.0
+        ai._state["key_idx"] = 0
 
     def reset_state(self):
         ai.reset_failures()

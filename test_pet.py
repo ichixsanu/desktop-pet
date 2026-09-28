@@ -260,9 +260,23 @@ class TestLedgeHandling(PetHarness):
         self.assertEqual(self.pet.x_pos, before)
 
     def test_validate_rejects_a_vanished_ledge(self):
-        self.pet.current_ledge = next(l for l in self.ledges() if l.y == 200)
-        self.pet.x_pos, self.pet.y_pos = 1000.0, self.pet.floor_y
-        self.assertFalse(self.pet._validate_current_ledge())
+        # Identity, not position: a pet seated at the very top of the screen has
+        # its feet below the titlebar it is standing on, so "is the pet over the
+        # ledge" is the wrong question to ask.
+        ledge = next(l for l in self.ledges() if l.y == 200)
+        self.pet.current_ledge = ledge
+        self.assertTrue(self.pet._validate_current_ledge())
+        with patch.object(self.pet.tracker, "_query_os_windows",
+                          return_value=([], None)):
+            self.pet.tracker.invalidate_cache()
+            self.assertFalse(self.pet._validate_current_ledge())
+
+    def test_validate_reseats_the_pet(self):
+        ledge = next(l for l in self.ledges() if l.y == 200)
+        self.pet.current_ledge = ledge
+        self.pet.y_pos = 5.0
+        self.assertTrue(self.pet._validate_current_ledge())
+        self.assertAlmostEqual(self.pet.y_pos, ledge.y - self.pet.sprite_h, delta=1.0)
 
     def test_validate_rejects_when_the_tracker_is_gone(self):
         self.pet.current_ledge = next(l for l in self.ledges() if l.y == 200)
@@ -394,6 +408,67 @@ class TestClimbing(PetHarness):
             self.pet._try_start_climb()
         self.assertLessEqual(self.pet.x_pos,
                              self.pet.screen_left + self.pet.screen_w - self.pet.sprite_w)
+
+
+class TestSpeechBubbleLayout(PetHarness):
+    """The bubble must never be drawn over the sprite.
+
+    This was the bug where the pet vanished every time it spoke, at every
+    scale: the widget is sprite_h + bubble_h tall with the bubble above the
+    sprite, but the sprite was drawn at the top of the widget, which is exactly
+    where the bubble goes.
+    """
+
+    def test_sprite_sits_below_the_bubble(self):
+        self.pet.speak("a line of dialogue")
+        self.pet._sync_widget_geometry()
+        self.assertFalse(self.pet.speech_below)
+        self.assertEqual(self.pet._sprite_offset(), self.pet.speech_bubble_h)
+        self.assertEqual(self.pet.height(),
+                         self.pet.sprite_h + self.pet.speech_bubble_h)
+        # The sprite's top must be the bottom of the bubble, not inside it.
+        self.assertGreaterEqual(self.pet._sprite_offset(), self.pet.speech_bubble_h)
+
+    def test_sprite_at_the_top_when_there_is_no_bubble(self):
+        self.pet.speak("hello")
+        self.pet._clear_speech()
+        self.assertEqual(self.pet._sprite_offset(), 0)
+
+    def test_bubble_flips_below_at_the_top_of_the_screen(self):
+        self.pet.y_pos = self.pet.screen_top + 1
+        self.pet.speak("a line of dialogue that needs a bubble above it")
+        self.pet._sync_widget_geometry()
+        self.assertTrue(self.pet.speech_below)
+        self.assertEqual(self.pet._sprite_offset(), 0)
+
+    def test_sprite_stays_inside_the_widget_either_way(self):
+        for y_pos, label in ((400.0, "bubble above"), (self.pet.screen_top + 1,
+                                                        "bubble below")):
+            with self.subTest(label):
+                self.pet.y_pos = y_pos
+                self.pet.speak("some dialogue for the bubble")
+                self.pet._sync_widget_geometry()
+                offset = self.pet._sprite_offset()
+                self.assertGreaterEqual(offset, 0)
+                self.assertLessEqual(offset + self.pet.sprite_h, self.pet.height())
+
+    def test_sprite_is_actually_painted(self):
+        # The sprite pixels have to be present in the rendered widget, not just
+        # accounted for on paper.
+        self.pet.speak("a line of dialogue")
+        self.pet._sync_widget_geometry()
+        image = self.pet.grab().toImage()
+        bottom = self.pet._sprite_offset() + self.pet.sprite_h
+        # Somewhere in the sprite band there must be a non-background pixel.
+        varied = False
+        for y in range(self.pet._sprite_offset(), min(bottom, image.height())):
+            for x in range(0, min(self.pet.sprite_w, image.width())):
+                if image.pixelColor(x, y).alpha() > 0:
+                    varied = True
+                    break
+            if varied:
+                break
+        self.assertTrue(varied, "nothing was painted where the sprite should be")
 
 
 class TestSpeechAndActivity(PetHarness):
@@ -836,7 +911,7 @@ class TestNewMovementStates(PetHarness):
         self.assertLessEqual(self.pet.x_pos + self.pet.sprite_w, ledge.x_max)
 
     def test_new_states_have_frames(self):
-        for state in ("JUMP", "POUNCE", "CHASE"):
+        for state in ("JUMP", "POUNCE", "CHASE", "LEAP"):
             self.pet.state = state
             self.assertTrue(self.pet.get_frames(), "no frames for %s" % state)
             self.assertIsNotNone(self.pet.get_current_frame())
@@ -1041,6 +1116,200 @@ class TestPersonalityEditor(PetHarness):
         self.assertIn("memory", stored)
 
 
+class TestLeaping(PetHarness):
+    """The pet has to be able to leave the taskbar, or nothing else matters."""
+
+    def place_on_floor(self, x):
+        self.pet.x_pos = float(x)
+        self.pet.y_pos = self.pet.floor_y
+        self.pet.vy = self.pet.vx = 0.0
+        self.pet.current_ledge = None
+        self.pet._enter_sit()
+
+    def use_windows(self, rects):
+        windows = [wt.WindowInfo(id=i + 1, title="W%d" % i, rect=r)
+                   for i, r in enumerate(rects)]
+        patcher = patch.object(self.pet.tracker, "_query_os_windows",
+                               return_value=(windows, None))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.refresh()
+
+    def run_until_settled(self, limit=8000):
+        cursor = MagicMock(x=lambda: 400, y=lambda: 400)
+        for _ in range(limit):
+            self.pet._update_fsm(cursor)
+            if self.pet.state in ("PERCH", "SIT", "IDLE") and self.pet.state_timer > 3:
+                return self.pet.state
+        return self.pet.state
+
+    def titlebars(self):
+        return self.pet._titlebar_ledges()
+
+    def test_solves_a_leap_to_a_window_straight_above(self):
+        self.use_windows([(0, 0, 1280, 700)])
+        self.place_on_floor(640)
+        solution = self.pet._leap_solution(self.titlebars()[0])
+        self.assertIsNotNone(solution, "a maximised window must be reachable")
+        vy0, vx, flight = solution
+        self.assertLess(vy0, 0, "must launch upwards")
+        self.assertAlmostEqual(vx, 0.0, places=6, msg="directly overhead: no drift")
+        self.assertGreater(flight, 10)
+        self.assertLessEqual(flight, P.LEAP_MAX_TICKS)
+
+    def test_declines_leaps_it_cannot_make(self):
+        self.use_windows([(0, 0, 1280, 700)])
+        self.place_on_floor(640)
+        ledge = self.titlebars()[0]
+        # Same height as the pet: that is a walk, not a leap.
+        level = wt.WalkableLedge(y=int(self.pet.floor_y) + self.pet.sprite_h,
+                                 x_min=0, x_max=1280)
+        self.assertIsNone(self.pet._leap_solution(level))
+        # Too far sideways.
+        self.assertIsNone(self.pet._leap_solution(ledge, x=-400))
+        # Absurdly high.
+        self.assertIsNone(self.pet._leap_solution(ledge, y=ledge.y - 5000))
+        # A floor ledge is never a leap target.
+        self.assertIsNone(self.pet._leap_solution(wt.WalkableLedge(
+            y=self.pet.floor_y + 32, x_min=0, x_max=1280, is_floor=True)))
+
+    def test_arc_lands_exactly_on_the_target(self):
+        # The analytic arc is the whole point: an integrated one overshoots the
+        # apex and lands short, which reads as the pet missing the window.
+        self.use_windows([(300, 250, 700, 700)])
+        self.place_on_floor(200)
+        ledge = self.titlebars()[0]
+        _vy0, _vx, flight = self.pet._leap_solution(ledge)
+        self.assertTrue(self.pet._start_leap(ledge))
+        target_top = float(ledge.y) - self.pet.sprite_h
+        apex = self.pet.y_pos
+        for _ in range(int(flight) + 8):
+            if self.pet.state != "LEAP":
+                break
+            self.pet._tick_leap()
+            apex = min(apex, self.pet.y_pos)
+        # It must clear the target, then come down onto it.
+        self.assertLess(apex, target_top, "arc never rose above the titlebar")
+        self.assertEqual(self.pet.state, "PERCH")
+        self.assertIs(self.pet.current_ledge, ledge)
+        self.assertAlmostEqual(self.pet.y_pos, target_top, delta=1.0)
+        self.assertTrue(ledge.holds_any(self.pet.x_pos,
+                                        self.pet.x_pos + self.pet.sprite_w))
+
+    def test_leap_lands_on_a_window_in_every_common_layout(self):
+        layouts = [
+            ([(0, 0, 1280, 700)], 100.0),      # maximised, far left
+            ([(0, 0, 1280, 700)], 1150.0),     # maximised, far right
+            ([(700, 380, 1100, 700)], 250.0),   # up and to the right
+            ([(150, 300, 400, 700)], 550.0),   # to the left
+            ([(0, 0, 600, 700), (650, 0, 1250, 700)], 640.0),  # side by side
+        ]
+        for rects, start_x in layouts:
+            with self.subTest(rects=rects, start_x=start_x):
+                self.setUp()
+                self.use_windows(rects)
+                self.place_on_floor(start_x)
+                self.assertTrue(self.pet._start_exploring())
+                self.assertEqual(self.run_until_settled(), "PERCH")
+                self.assertFalse(self.pet.current_ledge.is_floor)
+
+    def test_walks_under_a_far_window_then_leaps(self):
+        self.use_windows([(60, 90, 300, 400)])
+        self.place_on_floor(1000)
+        self.assertTrue(self.pet._start_exploring())
+        self.assertEqual(self.pet.state, "WALK", "should walk first")
+        self.assertIsNotNone(self.pet.goal_ledge)
+        self.assertEqual(self.run_until_settled(), "PERCH")
+
+    def test_gives_up_when_nothing_is_reachable(self):
+        # Nothing a pet could ever jump to: a titlebar at the very top of a
+        # very tall screen, with the rise limit squeezed.
+        self.use_windows([(0, 0, 1280, 700)])
+        self.place_on_floor(640)
+        with patch.object(P, "LEAP_MAX_RISE", 10.0):
+            self.assertIsNone(self.pet._pick_goal_ledge()[0])
+            self.assertFalse(self.pet._start_exploring())
+
+    def test_does_not_target_the_window_it_is_already_on(self):
+        self.use_windows([(300, 250, 700, 700)])
+        self.place_on_floor(400)
+        self.assertTrue(self.pet._start_exploring())
+        self.run_until_settled()
+        self.assertEqual(self.pet.state, "PERCH")
+        # Standing on it, there is nothing else to aim at.
+        self.assertIsNone(self.pet._pick_goal_ledge()[0])
+
+    def test_goal_anchor_is_the_nearest_point_not_the_middle(self):
+        ledge = wt.WalkableLedge(y=100, x_min=0, x_max=1280)
+        anchor = self.pet._goal_anchor(ledge, 32, here=100)
+        self.assertEqual(anchor, 100.0, "should not walk to the middle of a window")
+
+    def test_recent_ledges_bias_against_repeats(self):
+        self.pet._remember_ledge(wt.WalkableLedge(y=100, x_min=0, x_max=100))
+        self.pet._remember_ledge(wt.WalkableLedge(y=200, x_min=0, x_max=100))
+        self.assertEqual(self.pet.recent_ledges, [100, 200])
+        # Re-visiting moves it to the most-recent slot rather than duplicating.
+        self.pet._remember_ledge(wt.WalkableLedge(y=100, x_min=0, x_max=100))
+        self.assertEqual(self.pet.recent_ledges, [200, 100])
+
+    def test_closed_window_mid_leap_does_not_crash(self):
+        self.use_windows([(0, 0, 1280, 700)])
+        self.place_on_floor(640)
+        self.assertTrue(self.pet._start_leap(self.titlebars()[0]))
+        # The window closes while the pet is in the air. Landing on the stale
+        # ledge would leave it perching on a titlebar that no longer exists.
+        patcher = patch.object(self.pet.tracker, "_query_os_windows",
+                               return_value=([], None))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.pet.tracker.invalidate_cache()
+
+        for _ in range(400):
+            self.pet._update_fsm(MagicMock(x=lambda: 400, y=lambda: 400))
+            if self.pet.state in ("SIT", "IDLE", "PERCH"):
+                break
+        self.assertIn(self.pet.state, ("SIT", "IDLE"))
+        self.assertAlmostEqual(self.pet.y_pos, self.pet.floor_y, delta=1.0)
+
+    def test_leap_always_resolves(self):
+        self.use_windows([(0, 0, 1280, 700)])
+        self.place_on_floor(640)
+        self.assertTrue(self.pet._start_exploring())
+        for _ in range(3000):
+            self.pet._update_fsm(MagicMock(x=lambda: 400, y=lambda: 400))
+            if self.pet.state != "LEAP":
+                break
+        self.assertNotEqual(self.pet.state, "LEAP", "leap never resolved")
+        self.assertIn(self.pet.state, ("PERCH", "SIT", "IDLE"))
+        if self.pet.state == "PERCH":
+            self.assertFalse(self.pet.current_ledge.is_floor)
+
+    def test_leap_announces_arrival_not_a_drop(self):
+        self.use_windows([(0, 0, 1280, 700)])
+        self.place_on_floor(640)
+        with patch.object(self.pet, "_speak_contextual") as speak:
+            self.assertTrue(self.pet._start_exploring())
+            for _ in range(3000):
+                self.pet._update_fsm(MagicMock(x=lambda: 400, y=lambda: 400))
+                if self.pet.state in ("PERCH", "SIT", "IDLE") and self.pet.state_timer > 3:
+                    break
+        said = [call.args[0] for call in speak.call_args_list]
+        self.assertIn("climb", said)
+        self.assertIn("perch", said)
+        self.assertNotIn("drop", said, "a leap is not a drop")
+
+    def test_top_of_screen_ledge_keeps_the_pet_visible(self):
+        top = wt.WalkableLedge(y=0, x_min=0, x_max=1280)
+        self.pet.current_ledge = top
+        self.pet.y_pos = self.pet._stand_y(top)
+        self.assertGreaterEqual(self.pet.y_pos, self.pet.screen_top)
+        with patch.object(self.pet.tracker, "_query_os_windows",
+                          return_value=([wt.WindowInfo(id=1, title="Max",
+                                                       rect=(0, 0, 1280, 700))], None)):
+            self.pet.tracker.invalidate_cache()
+            self.assertTrue(self.pet._validate_current_ledge())
+
+
 class TestManualCapture(PetHarness):
     def _capture(self, thread_cls):
         with patch("pet.screen_capture.prepare_capture") as prepare:
@@ -1051,6 +1320,93 @@ class TestManualCapture(PetHarness):
                         with patch("pet.threading.Thread", thread_cls):
                             self.pet.maybe_screenshot(force=True)
         return prepare, slot, reserve
+
+    def test_pet_is_hidden_during_the_grab(self):
+        # Otherwise the model reads the pet's own speech bubble and comments on
+        # the pet commenting on the screen.
+        self.pet.show()
+        self.assertTrue(self.pet.isVisible())
+        seen = {}
+
+        def grab(*_args, **_kwargs):
+            seen["visible"] = self.pet.isVisible()
+            return MagicMock(), ""
+
+        with patch("pet.screen_capture.prepare_capture", side_effect=grab):
+            with patch("pet.ai_companion.ai_enabled", return_value=True):
+                with patch("pet.ai_companion.reserve_forced_screenshot"):
+                    with patch("pet.threading.Thread"):
+                        self.pet.maybe_screenshot(force=True)
+        self.assertFalse(seen.get("visible"), "pet was on screen while grabbing")
+        self.assertTrue(self.pet.isVisible(), "pet was not restored")
+
+    def test_pet_is_restored_even_if_the_grab_fails(self):
+        self.pet.show()
+        with patch("pet.screen_capture.prepare_capture",
+                   side_effect=RuntimeError("grab failed")):
+            with patch("pet.ai_companion.ai_enabled", return_value=True):
+                with patch("pet.ai_companion.reserve_forced_screenshot"):
+                    with self.assertRaises(RuntimeError):
+                        self.pet.maybe_screenshot(force=True)
+        self.assertTrue(self.pet.isVisible())
+
+    def test_menu_defers_the_capture_until_it_closes(self):
+        # Capturing from inside the menu action would put the pet's own menu in
+        # the screenshot.
+        from PyQt5.QtGui import QContextMenuEvent
+        from PyQt5.QtWidgets import QMenu
+
+        pet = self.pet
+        pet.show()
+
+        def exec_and_trigger(menu, _pos=None):
+            for action in menu.actions():
+                if action.text() == "Look At This":
+                    action.trigger()
+            return None
+
+        timers = []
+
+        def record_single_shot(ms, slot):
+            timers.append((ms, slot))
+
+        with patch.object(QMenu, "exec_", exec_and_trigger):
+            with patch.object(P.QTimer, "singleShot", staticmethod(record_single_shot)):
+                with patch.object(pet, "maybe_screenshot") as capture:
+                    pet.contextMenuEvent(
+                        QContextMenuEvent(QContextMenuEvent.Mouse, QPoint(10, 10)))
+
+                    capture.assert_not_called()   # not while the menu is up
+                    self.assertEqual(len(timers), 1, "no deferred capture scheduled")
+                    delay_ms, slot = timers[0]
+                    self.assertGreaterEqual(delay_ms, P.MENU_CLOSE_DELAY_MS)
+
+                    slot()                      # the menu has closed by now
+                    capture.assert_called_once_with(force=True)
+
+    def test_menu_does_not_capture_when_another_action_was_used(self):
+        from PyQt5.QtGui import QContextMenuEvent
+        from PyQt5.QtWidgets import QMenu
+
+        def exec_and_trigger(menu, _pos=None):
+            for action in menu.actions():
+                if action.text() == "Speak":
+                    action.trigger()
+            return None
+
+        timers = []
+        # Speak asks the model for a line; stub it, because a unit test must
+        # never make a real API call.
+        with patch.object(self.pet, "request_dialogue") as request:
+            with patch.object(QMenu, "exec_", exec_and_trigger):
+                with patch.object(P.QTimer, "singleShot",
+                                  staticmethod(lambda ms, slot: timers.append(ms))):
+                    with patch.object(self.pet, "maybe_screenshot") as capture:
+                        self.pet.contextMenuEvent(
+                            QContextMenuEvent(QContextMenuEvent.Mouse, QPoint(10, 10)))
+        request.assert_called_once()
+        capture.assert_not_called()
+        self.assertEqual(timers, [])
 
     def test_manual_capture_works_with_screenshots_disabled(self):
         # The automatic feature is off by default, but "Look At This" is a
