@@ -1,4 +1,6 @@
 __pycache__/
 *.pyc
 companion_memory.json
+pet_state.json
+pet.log
 .env

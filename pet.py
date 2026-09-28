@@ -39,7 +39,9 @@ from PyQt5.QtGui import (QPainter, QPixmap, QColor, QFont, QCursor,
 from PyQt5.QtWidgets import QApplication, QWidget, QMenu, QAction
 
 import ai_companion
+import pet_state
 import screen_capture
+from focus_timer import FocusWatcher, MODE_FOCUS
 
 try:
     import window_tracker
@@ -68,7 +70,7 @@ STATE_FILES = [
 FRAME_SPEED = {
     "SIT": 12, "IDLE": 12, "WALK": 6, "RUN": 4, "SLEEP": 15, "GROOM": 8,
     "STALK": 7, "BLINK": 5, "SWAT": 4, "CLIMB": 5, "DRAG": 6, "FALL": 4,
-    "PERCH": 12, "PAT": 3, "SPOOK": 4,
+    "PERCH": 12, "PAT": 3, "SPOOK": 4, "JUMP": 5, "POUNCE": 3, "CHASE": 4,
 }
 
 # ---- State durations, in ticks (20 ticks = 1s)
@@ -90,11 +92,28 @@ GRAVITY = 0.8          # px/tick^2
 TERMINAL_VEL = 12.0    # px/tick
 CLIMB_SPEED = 2.5      # px/tick upward (50 px/s)
 CLIMB_GRACE_TICKS = 30  # added to the computed budget before giving up
+JUMP_VELOCITY = 7.5    # px/tick upward when leaping off something
+CHASE_SPEED = 3.4      # px/tick while chasing the cursor
+
+# Energy: drained by exertion, restored by rest. Drives the pet's mood and how
+# likely it is to nap instead of playing.
+ENERGY_DRAIN = {
+    "WALK": 0.02, "STALK": 0.09, "RUN": 0.16, "CHASE": 0.18, "CLIMB": 0.07,
+    "JUMP": 0.12, "POUNCE": 0.14, "SWAT": 0.05, "GROOM": 0.01,
+}
+ENERGY_GAIN_IDLE = 0.05     # sitting around
+ENERGY_GAIN_SLEEP = 0.55    # asleep
+ENERGY_GAIN_PET = 15.0      # being petted
+ENERGY_GAIN_WAKE = 40.0     # waking up startled
+
+MOOD_SLEEPY_MAX = 30.0   # below this energy: sleepy
+MOOD_HAPPY_MIN = 70.0    # above this energy and recently petted: happy
 
 # Ticks between polls of the focused window (5s) and between unsolicited
 # contextual lines (30s).
 FOCUS_POLL_TICKS = 100
 CONTEXT_CHECK_INTERVAL = 600
+SAVE_INTERVAL_TICKS = 600   # 30s at 20 FPS
 # A context check only counts as activity if the focused window actually
 # changed, otherwise the "is anyone there" gate is satisfied forever.
 CURSOR_ACTIVITY_PX = 3
@@ -105,6 +124,9 @@ SCALE_PRESETS = {
     "3x (Large)": 3,
     "4x (Huge)": 4,
 }
+
+# FSM states that count as "exertion" for the purposes of chattiness.
+CALM_STATES = ("SIT", "IDLE", "SLEEP", "PERCH")
 
 # ---- Speech bubble
 SPEECH_FONT_FAMILY = "Consolas"
@@ -381,6 +403,8 @@ class DesktopPet(QWidget):
         self.tick_count = 0
         self.energy = 100.0
         self.target_x = None
+        self.petted_until_tick = None
+        self.session_start = time.time()
 
         # ---- drag ----
         self.dragging = False
@@ -407,6 +431,9 @@ class DesktopPet(QWidget):
         self.climb_target_edge = None
         self.climb_budget_ticks = 0
         self.current_ledge = None
+        # Movement extras, toggled from the menu.
+        self.allow_jump = True
+        self.allow_chase = True
 
         # ---- context tracking ----
         self.last_cursor = QCursor.pos()
@@ -430,6 +457,7 @@ class DesktopPet(QWidget):
                 self.tracker.set_screen_rect(self.screen_rect)
                 # Never generate ledges from the pet's own window.
                 self.tracker.add_excluded_pid(os.getpid())
+                self.tracker.set_ignored_windows(self._behaviour().get("ignore_windows", []))
                 self.tracker.start_background()
             except Exception:
                 log_exception("tracker init")
@@ -440,6 +468,18 @@ class DesktopPet(QWidget):
 
         # ---- screenshot state ----
         self._screenshot_inflight = False
+
+        # ---- focus / pomodoro awareness ----
+        focus_cfg = self._settings().get("focus", {})
+        self.focus = FocusWatcher(
+            focus_cfg.get("state_files") or [],
+            focus_cfg.get("poll_seconds", 5)) if focus_cfg.get("enabled", True) \
+            else FocusWatcher([], 5)
+        self.focus.poll(force=True)
+
+        # ---- persistent state ----
+        self.state_store = None
+        self._restore_state()
 
         # ---- monitor change handling ----
         app = QApplication.instance()
@@ -456,6 +496,89 @@ class DesktopPet(QWidget):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.game_loop)
         self.timer.start(50)
+
+    # =================================================================
+    # Config
+    # =================================================================
+
+    @staticmethod
+    def _settings():
+        return ai_companion.general_settings()
+
+    def _behaviour(self):
+        return self._settings().get("behaviour", {})
+
+    # =================================================================
+    # Persistent state
+    # =================================================================
+
+    def _state_path(self):
+        cfg = self._settings().get("state", {})
+        name = cfg.get("file") or "pet_state.json"
+        return name if os.path.isabs(name) else os.path.join(BASE_DIR, name)
+
+    def _restore_state(self):
+        """Come back as we were, minus the energy spent while we were away."""
+        cfg = self._settings().get("state", {})
+        if not cfg.get("enabled", True):
+            return
+        try:
+            store = pet_state.PetState(
+                self._state_path(),
+                save_interval=cfg.get("save_interval_seconds", 30))
+            data = store.load()
+            self.state_store = store
+
+            skin = data.get("skin")
+            if skin and skin in self.available_skins and skin != self.current_skin:
+                self.load_skin(skin)
+            scale = data.get("scale")
+            if scale in SCALE_PRESETS.values() and scale != self.scale_factor:
+                self.scale_factor = scale
+                self.load_skin(self.current_skin)
+
+            self.energy = store.rested_energy()
+            self.climb_enabled = bool(data.get("climb_enabled", True))
+            self.allow_jump = bool(self._behaviour().get("allow_jump", True))
+            self.allow_chase = bool(self._behaviour().get("allow_chase", True))
+
+            data["pet_count"] = (data.get("pet_count") or 0) + 1
+            store.touch(pet_count=data["pet_count"])
+            store.save(force=True)
+
+            # Only resume a position that still lands on a connected display.
+            x, y = data.get("x"), data.get("y")
+            if x is not None and y is not None:
+                screen = self._screen_for_point(x + self.sprite_w / 2,
+                                               y + self.sprite_h / 2)
+                if screen is not None and screen.geometry().contains(int(x), int(y)):
+                    self.x_pos, self.y_pos = float(x), float(y)
+                    self.current_ledge = None
+                    self.vy = 0.0
+                    self._enter_sit()
+                    if not self._is_on_ledge():
+                        self.y_pos = self.floor_y
+        except Exception:
+            log_exception("state restore")
+
+    def _save_state(self, force=False):
+        if self.state_store is None:
+            return
+        try:
+            self.state_store.touch(
+                skin=self.current_skin, scale=self.scale_factor,
+                energy=self.energy, x=self.x_pos, y=self.y_pos,
+                climb_enabled=self.climb_enabled,
+                seconds_alive=time.time() - self.session_start,
+            )
+            self.state_store.save(force=force)
+        except Exception:
+            log_exception("state save")
+
+    def forget_state(self):
+        if self.state_store is not None:
+            self.state_store.forget()
+        self.energy = 100.0
 
     # =================================================================
     # Screen / monitor geometry
@@ -603,6 +726,9 @@ class DesktopPet(QWidget):
             "PERCH":  ["sit", "idle", "walk"],
             "PAT":    ["pat", "sit", "idle"],
             "SPOOK":  ["spook", "sit", "idle"],
+            "JUMP":   ["walk", "stalk", "climb", "sit"],
+            "POUNCE": ["swat", "stalk", "walk", "sit"],
+            "CHASE":  ["run", "stalk", "walk", "sit"],
         }
         table = {}
         for state, names in fallbacks.items():
@@ -729,24 +855,33 @@ class DesktopPet(QWidget):
     # Screenshots
     # =================================================================
 
-    def maybe_screenshot(self):
+    def maybe_screenshot(self, force=False):
         """Occasionally grab the screen for a comment.
 
         The policy (interval, hourly and daily caps, AI availability) lives in
         ai_companion so there is one implementation of it. Pixels are grabbed
         here on the GUI thread because QPixmap demands it; redaction, JPEG
         encoding and the API call all happen on a worker.
+
+        `force` is the "Look at this" menu action: it skips the interval and
+        hourly caps, but never the blocklist -- privacy is not a quota.
         """
         if self._screenshot_inflight:
             return
         settings = ai_companion.screenshot_settings()
-        if not settings.get("enabled", False):
+        if not (settings.get("enabled", False) or force):
             return
-        required = float(settings.get("require_recent_activity_minutes", 3)) * 60 * 20
-        if self.tick_count - self.last_activity_tick > required:
+        if not force:
+            required = float(settings.get("require_recent_activity_minutes", 3)) * 60 * 20
+            if self.tick_count - self.last_activity_tick > required:
+                return
+            if not ai_companion.screenshot_slot_ok():
+                return
+        elif not ai_companion.ai_enabled():
+            # Nothing to send it to; don't grab the screen for no reason.
             return
-        if not ai_companion.screenshot_slot_ok():
-            return
+        else:
+            ai_companion.reserve_forced_screenshot()
 
         app = QApplication.instance()
         image, reason = screen_capture.prepare_capture(
@@ -775,7 +910,7 @@ class DesktopPet(QWidget):
                 captured = bool(encoded)
                 if encoded:
                     ai_companion.request_screenshot_comment(
-                        skin, encoded, self.ai_bridge.line_ready.emit)
+                        skin, encoded, self.ai_bridge.line_ready.emit, manual=force)
             except Exception:
                 log_exception("screenshot worker")
             finally:
@@ -816,6 +951,16 @@ class DesktopPet(QWidget):
             return
         if companion_dialogue is None:
             return
+        # Mid-focus the pet keeps its mouth shut: that is the whole point of a
+        # focus block.
+        if self.in_focus():
+            return
+
+        # Mood first: a drowsy pet does not have opinions about your window.
+        mood_event = self._mood_event()
+        if mood_event:
+            self._speak_contextual(mood_event)
+            return
 
         if self.last_window_title and random.random() < 0.7:
             event = "window"
@@ -825,6 +970,78 @@ class DesktopPet(QWidget):
             self.current_skin, event_type=event,
             window_title=self.last_window_title or "",
             window_proc=self.last_window_proc or ""))
+
+    # =================================================================
+    # Mood and energy
+    # =================================================================
+
+    def mood(self):
+        """'sleepy', 'happy' or 'content'.
+
+        Cheap to compute every tick: it is just energy, whether the pet was
+        petted recently, and whether the user is in a focus block.
+        """
+        if self.state == "SLEEP" or self.energy < MOOD_SLEEPY_MAX:
+            return "sleepy"
+        recently_petted = (self.petted_until_tick is not None
+                           and self.tick_count - self.petted_until_tick < 600)
+        if self.energy >= MOOD_HAPPY_MIN and recently_petted:
+            return "happy"
+        return "content"
+
+    def _drain_energy(self):
+        """Account for this tick's exertion, and rest when doing nothing."""
+        drain = ENERGY_DRAIN.get(self.state)
+        if drain is not None:
+            self.energy = max(0.0, self.energy - drain)
+        elif self.state == "SLEEP":
+            self.energy = min(100.0, self.energy + ENERGY_GAIN_SLEEP)
+        elif self.state in CALM_STATES:
+            self.energy = min(100.0, self.energy + ENERGY_GAIN_IDLE)
+
+    def _mood_event(self):
+        """The dialogue event matching the current mood, if any."""
+        mood = self.mood()
+        if mood == "sleepy":
+            return "sleepy"
+        if mood == "happy" and random.random() < 0.35:
+            return "happy"
+        return None
+
+    # =================================================================
+    # Focus sessions
+    # =================================================================
+
+    def _poll_focus_session(self):
+        """Watch the focus timer and react when the mode changes."""
+        if not self.focus.configured():
+            return
+        previous = self.focus.mode
+        self.focus.poll()
+        change = self.focus.transition(previous)
+        if not change:
+            return
+        # Only physical states suppress this. A session ending is exactly the
+        # sort of thing worth interrupting for -- the old code dropped the line
+        # whenever the pet happened to still be talking, which was most of the
+        # time.
+        if self.state in ("DRAG", "FALL"):
+            return
+        if change == "started":
+            self._speak_contextual("focus_start")
+        elif change == "ended":
+            self.energy = min(100.0, self.energy + 10.0)
+            self._speak_contextual("focus_end")
+        elif change == "break":
+            self.energy = min(100.0, self.energy + 15.0)
+            self.petted_until_tick = self.tick_count
+            self._speak_contextual("happy")
+
+    def in_focus(self):
+        try:
+            return self.focus.is_focus()
+        except Exception:
+            return False
 
     # =================================================================
     # Ledges
@@ -916,7 +1133,8 @@ class DesktopPet(QWidget):
         self.last_cursor = cursor
 
         if self.tick_count % FOCUS_POLL_TICKS == 0:
-            self._poll_focus()
+            self._poll_focus()        # which window is focused
+            self._poll_focus_session()  # whether the user is in a focus block
 
         if self.tick_count % CONTEXT_CHECK_INTERVAL == 0:
             self._check_window_context()
@@ -941,6 +1159,9 @@ class DesktopPet(QWidget):
             self._update_fsm(cursor)
             self.maybe_screenshot()
 
+        if self.tick_count % SAVE_INTERVAL_TICKS == 0:
+            self._save_state()
+
         self._sync_widget_geometry()
         self.update()
 
@@ -950,7 +1171,7 @@ class DesktopPet(QWidget):
 
     def _update_fsm(self, cursor):
         self.state_timer += 1
-        self.energy = max(0.0, self.energy - 0.01)
+        self._drain_energy()
 
         center_x = self.x_pos + self.sprite_w / 2.0
         center_y = self.y_pos + self.sprite_h / 2.0
@@ -968,6 +1189,11 @@ class DesktopPet(QWidget):
             return
         if self.state == "PERCH":
             self._tick_perch(cursor_dx, cursor_dist)
+            return
+        if self.state in ("JUMP", "POUNCE"):
+            # Airborne: no ground-lock, no x clamp against the floor, the arc
+            # handler owns the position until it lands.
+            self._tick_jump()
             return
 
         if self.is_ghost:
@@ -989,6 +1215,8 @@ class DesktopPet(QWidget):
         elif self.state == "GROOM":
             if self.state_timer > STATE_MAX_DURATION.get("GROOM", 100):
                 self._enter_sit()
+        elif self.state == "CHASE":
+            self._tick_chase(cursor_dx, cursor_dist)
         elif self.state == "STALK":
             self._tick_stalk(cursor_dx, cursor_dist)
         elif self.state == "WALK":
@@ -1002,7 +1230,7 @@ class DesktopPet(QWidget):
         elif self.state == "SLEEP":
             if (self.state_timer > STATE_MAX_DURATION.get("SLEEP", 300)
                     or cursor_dist < 30):
-                self.energy = min(100.0, self.energy + 40)
+                self.energy = min(100.0, self.energy + ENERGY_GAIN_WAKE)
                 self._enter_sit()
 
     def _tick_idle(self, cursor_dx, cursor_dist):
@@ -1032,7 +1260,11 @@ class DesktopPet(QWidget):
                             + random.choice([-1, 1]) * random.randint(60, 160)))
 
     def _pick_idle_transition(self, cursor_dx, cursor_dist, force=False):
-        if self.energy < 15:
+        mood = self.mood()
+        focusing = self.in_focus()
+
+        # A tired pet sleeps, and a sleeping pet does not get excited.
+        if self.energy < 15 or (mood == "sleepy" and random.random() < 0.35):
             self._enter_state("SLEEP")
             return
 
@@ -1057,21 +1289,90 @@ class DesktopPet(QWidget):
                 self._enter_state("WALK")
                 return
 
+        # Chasing and stalking are the energetic options: skip them when the
+        # pet is worn out, and skip all of them during a focus block.
+        energetic = (not focusing and mood != "sleepy"
+                     and self.energy > MOOD_SLEEPY_MAX)
+
         threshold += 0.06
-        if roll < threshold and 40 < cursor_dist < 300:
-            self._enter_state("RUN" if self.is_ghost else "STALK")
+        if roll < threshold and energetic and 40 < cursor_dist < 300:
+            if self.allow_chase and self.is_ghost:
+                self._enter_state("CHASE")
+            elif self.is_ghost:
+                self._enter_state("RUN")
+            elif self.allow_chase and self.energy > 55:
+                self._enter_state("CHASE")
+            else:
+                self._enter_state("STALK")
             return
 
         threshold += 0.05
-        if roll < threshold and self.climb_enabled and not self.is_ghost:
+        if roll < threshold and energetic and self.climb_enabled and not self.is_ghost:
             if self._try_start_climb():
                 return
+
+        # A small hop, mostly for pets that have energy to burn. Ghosts hover;
+        # they have nothing to push off with.
+        threshold += 0.04
+        if roll < threshold and energetic and self.allow_jump and not self.is_ghost \
+                and self.state_timer > 20 and not self._is_on_ledge():
+            self._start_jump()
+            return
 
         if force:
             target = self._walk_target()
             if target is not None:
                 self.target_x = target
                 self._enter_state("WALK")
+
+    # ---- JUMP ----------------------------------------------------------
+
+    def _start_jump(self, toward=None):
+        """Leap upwards, optionally toward a target x."""
+        self._enter_state("JUMP")
+        self.current_ledge = None
+        if toward is not None:
+            self.facing = 1 if toward >= self.x_pos else -1
+        self.vy = -JUMP_VELOCITY
+        if self.is_ghost:
+            # A ghost has no legs to push off with; it just rises and settles.
+            self.ghost_hover_y = self.y_pos - 40.0
+
+    def _tick_jump(self):
+        """JUMP is an arc: rise, then fall back under gravity."""
+        self.vy = min(self.vy + GRAVITY, TERMINAL_VEL)
+        self.y_pos += self.vy
+        if self.vy < 0:
+            return  # still going up
+        # A hop is not a drop, so it must not announce itself as one.
+        self._tick_fall(announce=False)
+
+    def _tick_chase(self, cursor_dx, cursor_dist):
+        """Sprint after the cursor, then pounce when close enough."""
+        if cursor_dx != 0:
+            self.facing = 1 if cursor_dx > 0 else -1
+        self.x_pos += self.facing * CHASE_SPEED
+        if self._clamp_to_ledge():
+            self._enter_sit()
+            return
+        if cursor_dist < 40:
+            self._start_jump(toward=self.x_pos + self.facing * 10)
+            self._enter_state("POUNCE")
+            return
+        if cursor_dist > 420 or self.state_timer > 220:
+            self._enter_state("SIT")
+            return
+        # Clamp here as well as in the dispatcher: a state handler that is only
+        # safe when called from one place is a trap.
+        low = float(self.screen_left)
+        high = float(self.screen_left + self.screen_w - self.sprite_w)
+        if self.x_pos <= low or self.x_pos >= high:
+            self.x_pos = max(low, min(high, self.x_pos))
+            self._enter_state("SIT")
+
+    def _tick_pounce(self):
+        """The airborne half of a pounce: same arc as JUMP."""
+        self._tick_jump()
 
     def _tick_stalk(self, cursor_dx, cursor_dist):
         if cursor_dx != 0:
@@ -1112,7 +1413,7 @@ class DesktopPet(QWidget):
 
     # ---- FALL ----------------------------------------------------------
 
-    def _tick_fall(self):
+    def _tick_fall(self, announce=True):
         self.vy = min(self.vy + GRAVITY, TERMINAL_VEL)
         self.y_pos += self.vy
 
@@ -1142,7 +1443,8 @@ class DesktopPet(QWidget):
                 self.current_ledge = None
                 self.y_pos = self.floor_y
                 self._enter_sit()
-            self._speak_contextual("drop")
+            if announce:
+                self._speak_contextual("drop")
 
         low = float(self.screen_left)
         high = float(self.screen_left + self.screen_w - self.sprite_w)
@@ -1265,7 +1567,12 @@ class DesktopPet(QWidget):
                 self._enter_state("WALK")
                 return
         elif roll < 0.15:
-            self._leave_ledge()
+            # Sometimes step off rather than dropping: it reads as a decision
+            # rather than a glitch. The arc still ends in _tick_fall.
+            if self.allow_jump and self.energy > 40:
+                self._start_jump()
+            else:
+                self._leave_ledge()
 
     def _leave_ledge(self):
         self.current_ledge = None
@@ -1389,10 +1696,14 @@ class DesktopPet(QWidget):
 
         if not was_dragging:
             self.heart_timer = 20
-            self.energy = min(100.0, self.energy + 15)
+            self.energy = min(100.0, self.energy + ENERGY_GAIN_PET)
+            self.petted_until_tick = self.tick_count
             event_type = (self.interaction.record_pet()
                           if self.interaction is not None else "pet_first")
             if self.interaction is not None:
+                # A sleepy pet grumbles instead of engaging.
+                if self.mood() == "sleepy" and random.random() < 0.5:
+                    event_type = "sleepy"
                 self._speak_contextual(event_type)
             else:
                 self.request_dialogue()
@@ -1436,24 +1747,47 @@ class DesktopPet(QWidget):
 
         menu.addSeparator()
 
-        climb_action = QAction("Climb Windows", self)
-        climb_action.setCheckable(True)
-        climb_action.setChecked(self.climb_enabled)
-        climb_action.triggered.connect(self._set_climb)
-        menu.addAction(climb_action)
+        self._add_toggle(menu, "Climb Windows", self.climb_enabled, self._set_climb)
+        self._add_toggle(menu, "Allow Jumping", self.allow_jump,
+                         lambda checked: setattr(self, "allow_jump", bool(checked)))
+        self._add_toggle(menu, "Allow Chasing", self.allow_chase,
+                         lambda checked: setattr(self, "allow_chase", bool(checked)))
+        if self.focus.configured():
+            focus_action = QAction("Focus Timer (%s)" % self.focus.describe(), self)
+            focus_action.setEnabled(False)
+            menu.addAction(focus_action)
 
         speak_action = QAction("Speak", self)
         speak_action.triggered.connect(self._menu_speak)
         menu.addAction(speak_action)
 
+        look_action = QAction("Look At This", self)
+        look_action.setToolTip("Capture the screen once and comment on it")
+        look_action.triggered.connect(self._menu_look)
+        menu.addAction(look_action)
+
+        personality_action = QAction("Edit Personality...", self)
+        personality_action.triggered.connect(self._menu_edit_personality)
+        menu.addAction(personality_action)
+
+        ignore_action = QAction("Ignore Windows...", self)
+        ignore_action.setToolTip("Windows the pet must not stand on")
+        ignore_action.triggered.connect(self._menu_edit_ignores)
+        menu.addAction(ignore_action)
+
         reset_action = QAction("Reset Position", self)
         reset_action.triggered.connect(self._reset_position)
         menu.addAction(reset_action)
 
+        forget_action = QAction("Forget Me", self)
+        forget_action.setToolTip("Delete saved position, skin and energy")
+        forget_action.triggered.connect(self._menu_forget)
+        menu.addAction(forget_action)
+
         menu.addSeparator()
-        info = QAction(self._status_text(), self)
-        info.setEnabled(False)
-        menu.addAction(info)
+        status = QAction(self._status_text(), self)
+        status.setEnabled(False)
+        menu.addAction(status)
         if self._ai_problem():
             retry = QAction("Retry AI", self)
             retry.triggered.connect(self._retry_ai)
@@ -1465,6 +1799,78 @@ class DesktopPet(QWidget):
         menu.addAction(quit_action)
 
         menu.exec_(event.globalPos())
+
+    def _add_toggle(self, menu, label, checked, handler):
+        action = QAction(label, self)
+        action.setCheckable(True)
+        action.setChecked(bool(checked))
+        action.triggered.connect(handler)
+        menu.addAction(action)
+        return action
+
+    # ---- menu actions --------------------------------------------------
+
+    def _menu_look(self):
+        self.heart_timer = 20
+        if self.speech_timer == 0:
+            self.speak("one sec, looking.")
+        self.maybe_screenshot(force=True)
+
+    def _menu_edit_personality(self):
+        """Edit this companion's system prompt without touching the JSON."""
+        from PyQt5.QtWidgets import (QDialog, QDialogButtonBox, QLabel,
+                                     QTextEdit, QVBoxLayout)
+
+        current = ai_companion.get_system_prompt(self.current_skin)
+        dialog = QDialog(self)
+        dialog.setWindowTitle("%s personality" % self.current_skin.capitalize())
+        dialog.resize(520, 360)
+
+        box = QVBoxLayout(dialog)
+        hint = QLabel(
+            "Instructions sent to the model with every line. One short sentence "
+            "of instructions is plenty. Leave empty to use the default.")
+        hint.setWordWrap(True)
+        box.addWidget(hint)
+
+        editor = QTextEdit(dialog)
+        editor.setPlainText(current)
+        box.addWidget(editor)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel, dialog)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        box.addWidget(buttons)
+
+        if dialog.exec_() == QDialog.Accepted:
+            text = editor.toPlainText().strip()
+            if ai_companion.set_system_prompt(self.current_skin, text):
+                self._speak_contextual("happy")
+            else:
+                self.speak("i couldn't save that. check companion_config.json")
+
+    def _menu_edit_ignores(self):
+        from PyQt5.QtWidgets import QInputDialog
+
+        current = ", ".join(self._behaviour().get("ignore_windows", []))
+        text, ok = QInputDialog.getText(
+            self, "Ignore windows",
+            "Comma-separated title or process fragments the pet must not\n"
+            "perch on or climb (it can still look at them):", text=current)
+        if not ok:
+            return
+        patterns = [part.strip() for part in text.split(",") if part.strip()]
+        behaviour = dict(self._behaviour())
+        behaviour["ignore_windows"] = patterns
+        ai_companion.CONFIG.setdefault("behaviour", {}).update(behaviour)
+        ai_companion.save_config()
+        if self.tracker is not None:
+            self.tracker.set_ignored_windows(patterns)
+        self._speak_contextual("pet_first")
+
+    def _menu_forget(self):
+        self.forget_state()
+        self._speak_contextual("greeting")
 
     def _status_text(self):
         status = ai_companion.ai_status()
@@ -1491,12 +1897,14 @@ class DesktopPet(QWidget):
         self.available_skins = discover_skins() or self.available_skins
         self.current_ledge = None
         self._reset_position()
+        self._save_state(force=True)
 
     def _set_scale(self, factor):
         self.scale_factor = factor
         self.load_skin(self.current_skin)
         self.current_ledge = None
         self._reset_position()
+        self._save_state(force=True)
 
     def _reset_position(self):
         self.x_pos = float(self.screen_left + self.screen_w // 2 - self.sprite_w // 2)
@@ -1508,17 +1916,44 @@ class DesktopPet(QWidget):
         self._sync_widget_geometry()
 
     def shutdown(self):
-        """Stop the poller and quit cleanly."""
+        """Stop the poller, save state, and quit cleanly."""
         try:
             self.timer.stop()
+            self._save_state(force=True)
             if self.tracker is not None:
                 self.tracker.stop_background()
         except Exception:
-            pass
+            log_exception("shutdown")
         QApplication.quit()
+
+    def _install_signal_handlers(self):
+        """Save state when the process is asked to stop.
+
+        systemd and pm2 both stop the pet with SIGTERM, and a default handler
+        kills the process outright, losing the position and energy.
+        """
+        import signal
+
+        def handler(signum, _frame):
+            try:
+                self._save_state(force=True)
+            except Exception:
+                pass
+            os._exit(0)
+
+        for name in ("SIGTERM", "SIGINT", "SIGHUP"):
+            signum = getattr(signal, name, None)
+            if signum is None:
+                continue
+            try:
+                signal.signal(signum, handler)
+            except (ValueError, OSError):
+                # Not the main thread, or the platform has no such signal.
+                pass
 
     def closeEvent(self, event):
         try:
+            self._save_state(force=True)
             if self.tracker is not None:
                 self.tracker.stop_background()
         except Exception:
@@ -1567,6 +2002,7 @@ def main():
     skins = discover_skins()
     start_skin = "cat" if "cat" in skins else (skins[0] if skins else "cat")
     pet = DesktopPet(skin=start_skin, scale=2)
+    pet._install_signal_handlers()
 
     try:
         return app.exec_()

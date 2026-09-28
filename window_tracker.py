@@ -775,6 +775,7 @@ class WindowTracker:
         exclude_titles: Optional[Sequence[str]] = None,
         exclude_pids: Optional[Sequence[int]] = None,
         coordinate_scale: float = 1.0,
+        ignore_windows: Optional[Sequence[str]] = None,
     ):
         self.cache_interval = max(0.1, float(cache_interval))
         self.min_window_width = min_window_width
@@ -782,6 +783,11 @@ class WindowTracker:
         self.exclude_titles = [t.lower() for t in (exclude_titles or []) if t]
         self.exclude_pids = {int(p) for p in (exclude_pids or []) if p}
         self.coordinate_scale = max(0.01, float(coordinate_scale))
+        # Windows the pet may look at but must not stand on: matched on title
+        # or process, applied only when building ledges and edges. These stay in
+        # `get_windows()` on purpose -- screenshot redaction has to see every
+        # window, including the ones the pet is ignoring.
+        self.ignore_windows = [w.lower() for w in (ignore_windows or []) if w]
 
         self._screen_rect: Optional[Tuple[int, int, int, int]] = None
         self._snapshot = WindowSnapshot([], None, [], [], None, 0.0, False, None, False)
@@ -826,6 +832,28 @@ class WindowTracker:
             with self._lock:
                 self.exclude_pids.add(int(pid))
             self.invalidate_cache()
+
+    def set_ignored_windows(self, patterns: Optional[Sequence[str]]) -> None:
+        """Windows the pet must not perch on or climb.
+
+        They remain in `get_windows()`: ignoring a window is about where the
+        pet may stand, not about whether it exists -- a redacted screenshot has
+        to account for the very windows the pet is ignoring.
+        """
+        cleaned = [str(p).lower() for p in (patterns or []) if p and str(p).strip()]
+        with self._lock:
+            if cleaned == self.ignore_windows:
+                return
+            self.ignore_windows = cleaned
+        self.invalidate_cache()
+
+    def ignores(self, window) -> bool:
+        """Whether a window is on the ignore list."""
+        if not self.ignore_windows or window is None:
+            return False
+        haystack = (window.title or "").lower()
+        process = (window.process or "").lower()
+        return any(p in haystack or p in process for p in self.ignore_windows)
 
     def invalidate_cache(self) -> None:
         """Force the next query to re-read the OS.
@@ -941,8 +969,10 @@ class WindowTracker:
             self._snapshot = WindowSnapshot(
                 windows=windows,
                 taskbar=self._cached_taskbar,
-                ledges=self._build_ledges(windows, self._cached_taskbar, screen_rect),
-                edges=self._build_edges(windows, screen_rect, include_screen_edges=True),
+                ledges=self._build_ledges(windows, self._cached_taskbar, screen_rect,
+                                          ignore=self.ignores),
+                edges=self._build_edges(windows, screen_rect, include_screen_edges=True,
+                                        ignore=self.ignores),
                 screen_rect=screen_rect,
                 at=self._last_poll_time,
                 detection_works=window_detection_available(),
@@ -965,10 +995,12 @@ class WindowTracker:
     # ---- geometry builders ---------------------------------------------
 
     @staticmethod
-    def _build_ledges(windows, taskbar, screen_rect) -> List[WalkableLedge]:
+    def _build_ledges(windows, taskbar, screen_rect, ignore=None) -> List[WalkableLedge]:
         ledges: List[WalkableLedge] = []
 
         for w in windows:
+            if ignore is not None and ignore(w):
+                continue
             top_y, left_x, right_x = w.top, w.left, w.right
             if screen_rect:
                 s_left, s_top, s_right, s_bottom = screen_rect
@@ -1005,10 +1037,13 @@ class WindowTracker:
         return ledges
 
     @staticmethod
-    def _build_edges(windows, screen_rect, include_screen_edges: bool = True) -> List[ClimbableEdge]:
+    def _build_edges(windows, screen_rect, include_screen_edges: bool = True,
+                     ignore=None) -> List[ClimbableEdge]:
         edges: List[ClimbableEdge] = []
 
         for w in windows:
+            if ignore is not None and ignore(w):
+                continue
             left_x, right_x, top_y, bot_y = w.left, w.right, w.top, w.bottom
             if screen_rect:
                 s_left, s_top, s_right, s_bottom = screen_rect
@@ -1073,7 +1108,8 @@ class WindowTracker:
         normalized = _normalize_screen_rect(screen_rect)
         if normalized == snapshot.screen_rect:
             return list(snapshot.ledges)
-        return self._build_ledges(snapshot.windows, snapshot.taskbar, normalized)
+        return self._build_ledges(snapshot.windows, snapshot.taskbar, normalized,
+                                  ignore=self.ignores)
 
     def get_climbable_edges(self, screen_rect: Any = None,
                             include_screen_edges: bool = True,
@@ -1087,7 +1123,8 @@ class WindowTracker:
             if normalized == snapshot.screen_rect:
                 edges = snapshot.edges
             else:
-                return self._build_edges(snapshot.windows, normalized, include_screen_edges)
+                return self._build_edges(snapshot.windows, normalized,
+                                         include_screen_edges, ignore=self.ignores)
         if not include_screen_edges:
             return [e for e in edges if not e.is_screen_edge]
         return list(edges)

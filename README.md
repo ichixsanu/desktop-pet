@@ -124,6 +124,91 @@ stripped wherever it appears, including mid-sentence, so a chatty model can't
 make the pet say "memory:" out loud. Delete `companion_memory.json` any time to
 wipe it. This adds no extra API calls — it rides along in the normal reply.
 
+## Coming back to the same pet
+
+The pet remembers where it was. `pet_state.json` holds its companion, scale,
+position, energy and whether window-climbing is on, and it is written every 30
+seconds, on every meaningful action, and when the process is stopped (including
+`SIGTERM`, which is how systemd and pm2 stop it — a default handler would throw
+the session away).
+
+Time away costs energy: about `state.energy_decay_per_hour` per hour, capped at
+eight hours, with a fifteen-minute grace period so restarting the app five times
+in a row doesn't exhaust anyone. A position is only restored if it is still on a
+connected display, so unplugging a monitor between sessions can't strand the
+pet off-screen. **Forget Me** in the menu deletes the file.
+
+## Moods and energy
+
+Energy drains when the pet is busy (walking, climbing, chasing, pouncing) and
+comes back when it rests or sleeps, so a pet that has been bouncing around
+eventually curls up, and a rested one is up for it. Three moods follow from
+that, and they change both behaviour and vocabulary:
+
+| mood | when | behaviour | voice |
+|------|------|-----------|-------|
+| `sleepy` | energy below 30, or asleep | naps more, never chases or leaps | `sleepy` lines |
+| `happy` | energy above 70 and petted recently | extra lively | `happy` lines |
+| `content` | otherwise | the usual | its normal pools |
+
+Waking up startled and being petted both restore energy, so the fastest way to
+cheer it up is a click.
+
+## Focus and pomodoro sessions
+
+The pet reads a small JSON file if one exists, and gets out of the way while
+you're working:
+
+```json
+{"mode": "focus", "remaining_minutes": 24, "label": "writing docs"}
+```
+
+`mode` is `"focus"` or `"break"`; every field is optional. Point it at your
+timer's state file in `companion_config.json`:
+
+```json
+"focus": {
+  "enabled": true,
+  "state_files": ["~/.focus.json", "~/.config/focus/state.json"],
+  "poll_seconds": 5
+}
+```
+
+Anything that can write that file works — a shell one-liner on a cron tick, a
+Taskwarrior hook, a Keyboard Maestro macro:
+
+```
+# start a 25 minute block
+python3 -c "import focus_timer; focus_timer.write_state('$HOME/.focus.json','focus',25,'deep work')"
+# and when it ends
+python3 -c "import focus_timer; focus_timer.write_state('$HOME/.focus.json','break')"
+```
+
+During a focus block the pet stops interrupting, stops chasing the cursor, and
+says one line at the start and one at the end. If the file disappears — because
+your timer stopped — the session is treated as over rather than ignored.
+
+## New movement
+
+- **Chase** — sprints after the cursor and pounces when it gets close, giving
+  up if you outrun it.
+- **Pounce / Jump** — real arcs under gravity, so a hop off a titlebar reads as
+  a decision rather than a glitch. Both can be switched off in the menu.
+
+## Windows the pet should ignore
+
+`behaviour.ignore_windows` is a list of title or process fragments. Matching
+windows are never stood on or climbed, but they are still *visible* to the app —
+screenshot redaction has to account for exactly the windows the pet is ignoring.
+**Ignore Windows...** in the menu edits the list and saves it.
+
+## Changing a personality without editing JSON
+
+**Edit Personality...** opens a box with the current companion's instructions —
+the same text as `companions.<skin>.system_prompt` — and applies it the moment
+you save. Clearing the box removes the override and falls back to
+`default_system_prompt`.
+
 ## Displays
 
 The pet lives in the monitor it's currently on and follows it across a
@@ -137,9 +222,15 @@ boundary.
 
 - **Switch Companion** — cat, shiba, ghost, jarvis, ultron.
 - **Scale** — 1x to 4x.
-- **Climb Windows** — toggle window-frame climbing.
+- **Climb Windows**, **Allow Jumping**, **Allow Chasing** — behaviour toggles.
 - **Speak** — ask for a line now.
+- **Look At This** — capture the screen once and comment on it. Works even when
+  the automatic screenshot feature is off, and still refuses whenever the
+  blocklist or the Wayland guarantee says so. Privacy is not a quota.
+- **Edit Personality...** — rewrite this companion's instructions in a dialog.
+- **Ignore Windows...** — windows the pet must not stand on.
 - **Reset Position** — back to the middle of the floor.
+- **Forget Me** — delete the saved session.
 - A status line showing whether AI is on, and **Retry AI** if it is configured
   but failing.
 - **Exit**.
@@ -153,11 +244,13 @@ available, canned line otherwise).
 python3 -m unittest discover -p 'test_*.py'
 ```
 
-174 tests, no third-party test runner needed. They cover the window-tracker's
-geometry, caching, HiDPI conversion and Wayland trust rules; the model's result
-contract, rate limiting, key rotation and `MEMORY:` parsing; redaction and the
-refusal rules; and the pet's FSM invariants (never `PERCH` without a ledge,
-never walk off a titlebar, climbs finish, drag clamping, bubble layout).
+239 tests, no third-party test runner needed. They cover the window-tracker's
+geometry, caching, HiDPI conversion, Wayland trust rules and ignore list; the
+model's result contract, rate limiting, key rotation and `MEMORY:` parsing;
+redaction and the refusal rules; persistence and the focus file; and the pet's
+FSM invariants — never `PERCH` without a ledge, never walk off a titlebar,
+climbs finish, drag clamping, bubble layout, mood and energy behaviour, and a
+6000-tick randomised run that asserts every invariant on every single tick.
 
 ## Troubleshooting
 

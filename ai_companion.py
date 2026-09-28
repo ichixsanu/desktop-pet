@@ -139,6 +139,16 @@ def _default_config():
             "jpeg_quality": 70,
         },
         "memory": {"enabled": True, "max_facts": 20},
+        "state": {"enabled": True, "file": "pet_state.json",
+                  "save_interval_seconds": 30, "energy_decay_per_hour": 8},
+        "focus": {"enabled": True,
+                  "state_files": ["~/.focus.json", "~/.config/focus/state.json"],
+                  "poll_seconds": 5},
+        "behaviour": {
+            "ignore_windows": [],
+            "allow_jump": True,
+            "allow_chase": True,
+        },
     }
 
 
@@ -247,6 +257,52 @@ def ai_status():
 
 def screenshot_settings():
     return CONFIG.get("screenshots", {})
+
+
+def general_settings():
+    """Config sections the pet itself reads (not the model's)."""
+    return CONFIG
+
+
+def set_system_prompt(skin, prompt):
+    """Set (or clear) a companion's personality and persist it.
+
+    Passing an empty string clears the override, so the companion falls back to
+    `default_system_prompt` again.
+    """
+    with _lock:
+        companions = CONFIG.setdefault("companions", {})
+        entry = companions.setdefault(skin, {})
+        prompt = (prompt or "").strip()
+        if prompt:
+            entry["system_prompt"] = prompt
+        else:
+            entry.pop("system_prompt", None)
+        return save_config()
+
+
+def get_system_prompt(skin):
+    entry = CONFIG.get("companions", {}).get(skin, {})
+    if not isinstance(entry, dict):
+        entry = {}
+    return entry.get("system_prompt") or ""
+
+
+def save_config():
+    """Write CONFIG back to companion_config.json, atomically."""
+    tmp = CONFIG_PATH + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(CONFIG, handle, indent=2)
+        os.replace(tmp, CONFIG_PATH)
+        return True
+    except OSError as exc:
+        _warn_once("config_write", "could not save companion_config.json: %r" % (exc,))
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return False
 
 
 # =====================================================================
@@ -425,6 +481,20 @@ def screenshot_slot_ok():
     if not screenshot_daily_ok():
         return False
     return _reserve("screenshot")
+
+
+def reserve_forced_screenshot() -> bool:
+    """Claim a screenshot slot for a user-initiated capture.
+
+    "Look at this" bypasses the interval and hourly caps, but still goes
+    through the daily cap so a curious user cannot burn a month's quota in an
+    afternoon. Privacy checks are not part of this at all -- those live in
+    screen_capture and are not negotiable.
+    """
+    if not screenshot_daily_ok():
+        return False
+    _reserve("screenshot")
+    return True
 
 
 def record_capture_attempt(captured):
@@ -606,14 +676,20 @@ def maybe_idle_line(skin, on_done):
     _run_worker(work)
 
 
-def request_screenshot_comment(skin, image_b64, on_done):
+def request_screenshot_comment(skin, image_b64, on_done, manual=False):
     """Ask for a reaction to an already-captured screenshot.
 
-    The caller must have won a slot via screenshot_slot_ok() and must call
-    _mark_capture() once the capture actually happened.
+    The caller must have won a slot via screenshot_slot_ok() (or
+    reserve_forced_screenshot()) and must call record_capture_attempt() once
+    the capture actually happened.
+
+    `manual` is a user-initiated capture from the menu: it works even when the
+    automatic screenshot feature is switched off, because the user asked for it
+    directly. The privacy blocklist still applies -- that is enforced in
+    screen_capture before any pixels are read.
     """
     scfg = CONFIG.get("screenshots", {})
-    if not ai_enabled() or not scfg.get("enabled", False):
+    if not ai_enabled() or (not scfg.get("enabled", False) and not manual):
         on_done(None, STATUS_UNAVAILABLE)
         return
 

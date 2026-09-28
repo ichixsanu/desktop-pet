@@ -30,5 +30,21 @@
     "blocklist": ["keepass", "bitwarden", "1password", "signal", "private browsing", "incognito", "bank", "wallet"],
     "jpeg_quality": 70
   },
-  "memory": {"enabled": true, "max_facts": 20}
+  "memory": {"enabled": true, "max_facts": 20},
+  "state": {
+    "enabled": true,
+    "file": "pet_state.json",
+    "save_interval_seconds": 30,
+    "energy_decay_per_hour": 8
+  },
+  "focus": {
+    "enabled": true,
+    "state_files": ["~/.focus.json", "~/.config/focus/state.json"],
+    "poll_seconds": 5
+  },
+  "behaviour": {
+    "ignore_windows": [],
+    "allow_jump": true,
+    "allow_chase": true
+  }
 }

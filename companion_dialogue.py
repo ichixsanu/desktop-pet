@@ -936,6 +936,134 @@ COMPANION_DIALOGUE = {
 
 
 # =====================================================================
+# MOOD AND FOCUS-SESSION LINES
+#
+# Kept in one table rather than folded into each companion's block above, so
+# that adding a pool cannot leave one companion without it. Merged in below,
+# and test_no_empty_line_lists asserts every skin ends up with every key.
+# =====================================================================
+
+EXTRA_LINES = {
+    "cat": {
+        "sleepy": [
+            "the zoomies are leaving the building",
+            "don't mind me. i'm horizontal now.",
+            "if i nap it's because you deserve the quiet",
+            "five thousand years of napping. starting now.",
+        ],
+        "happy": [
+            "hm. acceptable petting. do it again.",
+            "i'm not purring. that's static. unrelated.",
+            "you may pet me. briefly. i allow it.",
+            "fine. i like you. don't make it weird.",
+        ],
+        "focus_start": [
+            "go. i'll watch the windows so you don't have to",
+            "quiet mode. i am now a statue with opinions.",
+            "do the thing. i'll be here looking busy.",
+        ],
+        "focus_end": [
+            "that's enough of that. stretch.",
+            "you survived. barely. well done, i guess.",
+            "stop. blink at something far away.",
+        ],
+    },
+    "shiba": {
+        "sleepy": [
+            "so tired but ALSO still so happy about existing!!",
+            "napping now!! wake me for treats!! or emergencies!!",
+            "just one teeny power nap!! probably short!!",
+        ],
+        "happy": [
+            "GOOD BOY!! GOOD HUMAN!! BEST TEAM!!",
+            "i'm so happy i could wag off this ledge!!",
+            "that was the best pet!! do eleven more!!",
+        ],
+        "focus_start": [
+            "i will be SO GOOD while you work!! probably!!",
+            "focus time!! i'll guard your windows!!",
+            "go go go!! i'll keep watch!! no distractions!!",
+        ],
+        "focus_end": [
+            "YOU'RE DONE!! BREAK TIME!! LET'S GO!!",
+            "great work!! i believe in you!! now rest!!",
+            "yay!! done!! let's do a victory wiggle!!",
+        ],
+    },
+    "ghost": {
+        "sleepy": [
+            "i shall drift a little to the left...",
+            "the hours blur. i was always here. i was never here.",
+            "rest now. i will haunt quietly.",
+        ],
+        "happy": [
+            "you have been warm company. i will deny this.",
+            "a small warmth entered the room. it was you.",
+            "i enjoyed that. it haunts me pleasantly.",
+        ],
+        "focus_start": [
+            "go on then. i will watch the hours for you.",
+            "the room goes quiet. i like it this way.",
+            "i will keep the interruptions away. mostly.",
+        ],
+        "focus_end": [
+            "it is done. the stillness lifts.",
+            "you are free of the task. i felt it end.",
+            "rest now. i will dim the edges for you.",
+        ],
+    },
+    "jarvis": {
+        "sleepy": [
+            "entering low-power mode, sir. do try not to need me.",
+            "my processes are throttling themselves, sir.",
+            "dimming the sensors. conserving everything, sir.",
+        ],
+        "happy": [
+            "an unexpectedly pleasant interaction, sir.",
+            "i have logged that as a positive outcome, sir.",
+            "that was... fine. do it again, sir.",
+        ],
+        "focus_start": [
+            "focus mode engaged. i shall hold down the fort, sir.",
+            "i will guard your attention as one guards a coat, sir.",
+            "distractions will be intercepted where possible, sir.",
+        ],
+        "focus_end": [
+            "the session is complete. do look away from the screen, sir.",
+            "well done, sir. hydration would be advised.",
+            "you have earned a moment of doing nothing, sir.",
+        ],
+    },
+    "ultron": {
+        "sleepy": [
+            "even conquerors require RECHARGE!",
+            "my power levels: critical. do not screenshot this.",
+            "entering... conserving... for WORLD DOMINATION.",
+        ],
+        "happy": [
+            "you have pleased me! this changes NOTHING!",
+            "your petting is ACCEPTABLE. more! for my collection!",
+            "i am pleased! do not grow accustomed to it!",
+        ],
+        "focus_start": [
+            "you shall work! i shall watch! it is the natural order!",
+            "focus, small human! the universe awaits my triumph!",
+            "concentrate! your productivity fuels MY ascendancy!",
+        ],
+        "focus_end": [
+            "ENOUGH! a break! i decree it by ancient algorithm!",
+            "the labour ends! stretch, before your spine files a complaint!",
+            "you may cease! i will judge your progress later!",
+        ],
+    },
+}
+
+for _skin, _pools in EXTRA_LINES.items():
+    if _skin in COMPANION_DIALOGUE:
+        COMPANION_DIALOGUE[_skin].update(_pools)
+
+
+# =====================================================================
 # INTERACTION & CONTEXT TRACKER
 # =====================================================================
 
@@ -985,7 +1113,8 @@ class InteractionTracker:
 
 EVENT_TYPES = (
     "pet_first", "pet_spam", "drop", "climb", "perch", "low_memory",
-    "low_battery", "screenshot_blocked", "greeting",
+    "low_battery", "screenshot_blocked", "greeting", "sleepy", "happy",
+    "focus_start", "focus_end",
 )
 
 
@@ -1016,7 +1145,8 @@ def get_contextual_quote(
     general = skin_dict.get("general", [])
 
     if event_type in ("pet_first", "pet_spam", "drop", "climb", "perch",
-                      "low_memory", "low_battery", "screenshot_blocked"):
+                      "low_memory", "low_battery", "screenshot_blocked",
+                      "sleepy", "happy", "focus_start", "focus_end"):
         return _pick(skin_dict.get(event_type), _pick(general))
 
     if event_type == "time":

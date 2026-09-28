@@ -17,6 +17,8 @@ from PyQt5.QtGui import QFont, QFontMetrics  # noqa: E402
 from PyQt5.QtWidgets import QApplication  # noqa: E402
 
 import companion_dialogue as cd  # noqa: E402
+import json  # noqa: E402
+
 import pet as P  # noqa: E402
 import window_tracker as wt  # noqa: E402
 
@@ -167,7 +169,31 @@ class PetHarness(unittest.TestCase):
         wt.WindowInfo(id=2, title="Window B", rect=(400, 400, 900, 750)),
     ]
 
+    def land(self, x, y):
+        """Drop the pet from (x, y) and return the state it settles into."""
+        self.pet.x_pos, self.pet.y_pos = float(x), float(y)
+        self.pet.vy = 0.0
+        self.pet._enter_fall()
+        for _ in range(2000):
+            self.pet._tick_fall()
+            if self.pet.state != "FALL":
+                return self.pet.state
+        return "FALL"
+
     def setUp(self):
+        # Never touch the real pet_state.json: a leftover file would silently
+        # decide which skin and position every test runs with.
+        import copy
+
+        import ai_companion
+
+        config = copy.deepcopy(ai_companion.CONFIG)
+        config.setdefault("state", {})["enabled"] = False
+        config.setdefault("focus", {})["enabled"] = False
+        patcher = patch.object(ai_companion, "CONFIG", config)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
         self.pet = P.DesktopPet(skin="cat", scale=2)
         self.pet.timer.stop()
         self.apply_screen()
@@ -245,16 +271,6 @@ class TestLedgeHandling(PetHarness):
 
 
 class TestFallingAndPerching(PetHarness):
-    def land(self, x, y):
-        self.pet.x_pos, self.pet.y_pos = float(x), float(y)
-        self.pet.vy = 0.0
-        self.pet._enter_fall()
-        for _ in range(2000):
-            self.pet._tick_fall()
-            if self.pet.state != "FALL":
-                return self.pet.state
-        return "FALL"
-
     def test_lands_on_a_titlebar_and_perches(self):
         self.assertEqual(self.land(200, 50), "PERCH")
         self.assertIsNotNone(self.pet.current_ledge)
@@ -571,13 +587,6 @@ class TestScreenshotWiring(PetHarness):
 
 
 class TestDragAndGeometry(PetHarness):
-    def test_drag_clears_the_ledge(self):
-        self.assertEqual(self.land_helper(), "PERCH")
-        self.pet.mousePressEvent(MagicMock(button=lambda: Qt.LeftButton,
-                                           globalPos=lambda: QPoint(300, 300)))
-        self.assertIsNone(self.pet.current_ledge)
-        self.assertEqual(self.pet.state, "DRAG")
-
     def land_helper(self):
         self.pet.x_pos, self.pet.y_pos = 200.0, 50.0
         self.pet.vy = 0.0
@@ -587,6 +596,13 @@ class TestDragAndGeometry(PetHarness):
             if self.pet.state != "FALL":
                 return self.pet.state
         return "FALL"
+
+    def test_drag_clears_the_ledge(self):
+        self.assertEqual(self.land_helper(), "PERCH")
+        self.pet.mousePressEvent(MagicMock(button=lambda: Qt.LeftButton,
+                                           globalPos=lambda: QPoint(300, 300)))
+        self.assertIsNone(self.pet.current_ledge)
+        self.assertEqual(self.pet.state, "DRAG")
 
     def test_stays_within_the_desktop(self):
         move = MagicMock(buttons=lambda: Qt.LeftButton,
@@ -646,6 +662,492 @@ class TestDragAndGeometry(PetHarness):
         self.assertIsNotNone(first)
         self.assertTrue(self.pet._flipped_cache)
         self.assertIs(first, self.pet.get_current_frame())
+
+
+class TestMoodsAndEnergy(PetHarness):
+    def test_content_by_default(self):
+        self.pet.energy = 50.0
+        self.pet.petted_until_tick = None
+        self.assertEqual(self.pet.mood(), "content")
+
+    def test_sleepy_when_tired(self):
+        self.pet.energy = P.MOOD_SLEEPY_MAX - 1
+        self.assertEqual(self.pet.mood(), "sleepy")
+
+    def test_sleepy_while_asleep_even_when_full(self):
+        self.pet.energy = 100.0
+        self.pet._enter_state("SLEEP")
+        self.assertEqual(self.pet.mood(), "sleepy")
+
+    def test_happy_only_after_being_petted(self):
+        self.pet.energy = 100.0
+        self.pet.petted_until_tick = None
+        self.assertEqual(self.pet.mood(), "content")
+        self.pet.petted_until_tick = self.pet.tick_count
+        self.assertEqual(self.pet.mood(), "happy")
+
+    def test_happy_expires(self):
+        self.pet.energy = 100.0
+        self.pet.petted_until_tick = self.pet.tick_count - 601
+        self.assertEqual(self.pet.mood(), "content")
+
+    def test_energy_drains_with_exertion(self):
+        self.pet.energy = 100.0
+        self.pet._enter_state("CHASE")
+        for _ in range(50):
+            self.pet._drain_energy()
+        self.assertLess(self.pet.energy, 100.0)
+
+    def test_energy_recovers_while_sitting(self):
+        self.pet.energy = 50.0
+        self.pet._enter_state("SIT")
+        self.pet._drain_energy()
+        self.assertGreater(self.pet.energy, 50.0)
+
+    def test_energy_recovers_while_sleeping(self):
+        self.pet.energy = 10.0
+        self.pet._enter_state("SLEEP")
+        for _ in range(20):
+            self.pet._drain_energy()
+        self.assertGreater(self.pet.energy, 10.0)
+
+    def test_energy_never_leaves_range(self):
+        self.pet.energy = 99.0
+        self.pet._enter_state("SLEEP")
+        for _ in range(500):
+            self.pet._drain_energy()
+        self.assertLessEqual(self.pet.energy, 100.0)
+        self.pet.energy = 1.0
+        self.pet._enter_state("CHASE")
+        for _ in range(500):
+            self.pet._drain_energy()
+        self.assertGreaterEqual(self.pet.energy, 0.0)
+
+    def test_tired_pet_prefers_sleep(self):
+        self.pet.energy = 5.0
+        self.pet.state_timer = 100
+        self.pet._tick_idle(0, 100)
+        self.assertEqual(self.pet.state, "SLEEP")
+
+    def test_tired_pet_does_not_chase(self):
+        # Clearly below MOOD_SLEEPY_MAX, so the pet is sleepy and must not
+        # start anything energetic.
+        for _ in range(50):
+            self.pet.energy = 20.0
+            self.pet._enter_state("SIT")
+            self.pet.state_timer = 200
+            self.pet._pick_idle_transition(40, 100)
+            self.assertNotIn(self.pet.state, ("CHASE", "STALK", "JUMP", "POUNCE"),
+                             "exhausted pet started %s" % self.pet.state)
+
+    def test_mood_drives_the_line_choice(self):
+        self.pet.energy = 10.0
+        self.assertEqual(self.pet._mood_event(), "sleepy")
+        self.pet.energy = 100.0
+        self.pet.petted_until_tick = self.pet.tick_count
+        with patch("pet.random.random", return_value=0.0):
+            self.assertEqual(self.pet._mood_event(), "happy")
+        with patch("pet.random.random", return_value=0.9):
+            self.assertIsNone(self.pet._mood_event())
+
+
+class TestNewMovementStates(PetHarness):
+    def test_jump_rises_then_lands(self):
+        self.pet.x_pos = 300.0
+        self.pet.y_pos = self.pet.floor_y
+        self.pet.current_ledge = None
+        self.pet._start_jump()
+        self.assertEqual(self.pet.state, "JUMP")
+        start = self.pet.y_pos
+        highest = start
+        for _ in range(400):
+            self.pet._tick_jump()
+            highest = min(highest, self.pet.y_pos)
+            if self.pet.state != "JUMP":
+                break
+        self.assertLess(highest, start, "a jump should leave the ground")
+        self.assertEqual(self.pet.state, "SIT")
+        self.assertAlmostEqual(self.pet.y_pos, self.pet.floor_y)
+
+    def test_jump_does_not_announce_a_drop(self):
+        self.pet.y_pos = self.pet.floor_y
+        self.pet._start_jump()
+        with patch.object(self.pet, "_speak_contextual") as speak:
+            for _ in range(400):
+                self.pet._tick_jump()
+                if self.pet.state != "JUMP":
+                    break
+        speak.assert_not_called()
+
+    def test_chase_closes_on_the_cursor(self):
+        # A cursor that stays put: the pet must actually reach it rather than
+        # sprint past, because cursor_dist is recomputed every tick in the real
+        # loop and flips it into a pounce.
+        target = 300.0
+
+        def distance():
+            return abs(target - (self.pet.x_pos + self.pet.sprite_w / 2))
+
+        self.pet.x_pos = 200.0
+        self.pet.y_pos = self.pet.floor_y
+        self.pet._enter_state("CHASE")
+        before = distance()
+        for _ in range(200):
+            dx = target - (self.pet.x_pos + self.pet.sprite_w / 2)
+            self.pet._tick_chase(dx, abs(dx))
+            if self.pet.state != "CHASE":
+                break
+        self.assertLess(distance(), before)
+        self.assertIn(self.pet.state, ("POUNCE", "JUMP", "SIT"))
+
+    def test_chase_becomes_a_pounce_up_close(self):
+        self.pet.x_pos = 300.0
+        self.pet.y_pos = self.pet.floor_y
+        self.pet._enter_state("CHASE")
+        self.pet._tick_chase(1, 20)
+        self.assertEqual(self.pet.state, "POUNCE")
+
+    def test_chase_gives_up_on_a_fleeing_cursor(self):
+        self.pet.x_pos = 300.0
+        self.pet.y_pos = self.pet.floor_y
+        self.pet._enter_state("CHASE")
+        self.pet._tick_chase(100, 900)
+        self.assertEqual(self.pet.state, "SIT")
+
+    def test_chase_stops_at_the_screen_edge(self):
+        self.pet.x_pos = 40.0
+        self.pet.y_pos = self.pet.floor_y
+        self.pet._enter_state("CHASE")
+        for _ in range(60):
+            if self.pet.state != "CHASE":
+                break
+            self.pet._tick_chase(-50, 50)
+        self.assertEqual(self.pet.state, "SIT")
+        self.assertGreaterEqual(self.pet.x_pos, self.pet.screen_left)
+
+    def test_chase_cannot_run_off_a_ledge(self):
+        self.assertEqual(PetHarness.land(self, 200, 50), "PERCH")
+        ledge = self.pet.current_ledge
+        self.pet._enter_state("CHASE")
+        for _ in range(200):
+            self.pet._tick_chase(200, 200)
+            if self.pet.state != "CHASE":
+                break
+        self.assertLessEqual(self.pet.x_pos + self.pet.sprite_w, ledge.x_max)
+
+    def test_new_states_have_frames(self):
+        for state in ("JUMP", "POUNCE", "CHASE"):
+            self.pet.state = state
+            self.assertTrue(self.pet.get_frames(), "no frames for %s" % state)
+            self.assertIsNotNone(self.pet.get_current_frame())
+
+    def test_jump_can_be_switched_off(self):
+        self.pet.allow_jump = False
+        self.pet.energy = 100.0
+        self.pet.state_timer = 200
+        with patch("pet.random.random", return_value=0.30):
+            self.pet._pick_idle_transition(40, 100)
+        self.assertNotEqual(self.pet.state, "JUMP")
+
+
+class TestFocusBehaviour(PetHarness):
+    def setUp(self):
+        super().setUp()
+        import tempfile
+
+        import focus_timer
+
+        self.focus_timer = focus_timer
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.focus_path = os.path.join(self.tmp.name, "focus.json")
+        # poll_seconds=0 means "read on every call".
+        self.pet.focus = focus_timer.FocusWatcher([self.focus_path], poll_seconds=0)
+
+    def write_focus(self, mode="focus", label="docs"):
+        self.focus_timer.write_state(self.focus_path, mode, label=label)
+
+    def establish_focus(self):
+        """Put the pet in a focus block it already knows about."""
+        self.write_focus("focus")
+        self.pet._poll_focus_session()
+
+    def test_no_file_means_no_reaction(self):
+        with patch.object(self.pet, "_speak_contextual") as speak:
+            self.pet._poll_focus_session()
+        speak.assert_not_called()
+        self.assertFalse(self.pet.in_focus())
+
+    def test_session_start_speaks(self):
+        with patch.object(self.pet, "_speak_contextual") as speak:
+            self.write_focus("focus")
+            self.pet._poll_focus_session()
+        speak.assert_called_once_with("focus_start")
+        self.assertTrue(self.pet.in_focus())
+
+    def test_session_end_speaks_and_rests(self):
+        self.establish_focus()
+        self.pet.energy = 50.0
+        with patch.object(self.pet, "_speak_contextual") as speak:
+            self.write_focus("break")
+            self.pet._poll_focus_session()
+        speak.assert_called_once_with("focus_end")
+        self.assertGreater(self.pet.energy, 50.0)
+        self.assertFalse(self.pet.in_focus())
+
+    def test_break_without_focus_is_celebrated(self):
+        with patch.object(self.pet, "_speak_contextual") as speak:
+            self.write_focus("break")
+            self.pet._poll_focus_session()
+        speak.assert_called_once_with("happy")
+
+    def test_repeated_polls_do_not_repeat_the_line(self):
+        self.establish_focus()
+        with patch.object(self.pet, "_speak_contextual") as speak:
+            self.pet._poll_focus_session()
+            self.pet._poll_focus_session()
+        speak.assert_not_called()
+
+    def test_file_disappearing_ends_the_session(self):
+        self.establish_focus()
+        with patch.object(self.pet, "_speak_contextual") as speak:
+            os.unlink(self.focus_path)
+            self.pet._poll_focus_session()
+        speak.assert_called_once_with("focus_end")
+
+    def test_transition_interrupts_existing_speech(self):
+        # The pet is mid-sentence when the timer ends; the user still needs to
+        # know, so the session-end line replaces it.
+        self.establish_focus()
+        self.pet.speak("something long and ongoing")
+        self.assertGreater(self.pet.speech_timer, 0)
+        with patch.object(self.pet, "_speak_contextual") as speak:
+            self.write_focus("break")
+            self.pet._poll_focus_session()
+        speak.assert_called_once_with("focus_end")
+
+    def test_transition_waits_while_being_dragged(self):
+        self.establish_focus()
+        self.pet._enter_state("DRAG")
+        with patch.object(self.pet, "_speak_contextual") as speak:
+            self.write_focus("break")
+            self.pet._poll_focus_session()
+        speak.assert_not_called()
+
+    def test_pet_stops_chatter_during_focus(self):
+        self.establish_focus()
+        self.pet.speech_timer = 0
+        self.pet.last_window_title = "Editor"
+        with patch.object(self.pet, "speak") as speak:
+            self.pet._check_window_context()
+        speak.assert_not_called()
+
+    def test_pet_does_not_chase_during_focus(self):
+        self.establish_focus()
+        for _ in range(40):
+            self.pet.energy = 100.0
+            self.pet._enter_state("SIT")
+            self.pet.state_timer = 200
+            self.pet._pick_idle_transition(40, 100)
+            self.assertNotIn(self.pet.state, ("CHASE", "STALK", "POUNCE"))
+
+    def test_chatter_resumes_after_the_session(self):
+        self.establish_focus()
+        self.write_focus("break")
+        self.pet._poll_focus_session()
+        self.assertFalse(self.pet.in_focus())
+        self.pet.speech_timer = 0
+        self.pet.last_window_title = "Editor"
+        with patch.object(self.pet, "speak") as speak:
+            self.pet._check_window_context()
+        speak.assert_called_once()
+
+
+class TestIgnoreList(PetHarness):
+    def test_ignored_windows_are_not_ledges(self):
+        self.pet.tracker.set_ignored_windows(["window a"])
+        self.refresh()
+        ledges = self.pet.tracker.get_walkable_ledges()
+        self.assertEqual([l for l in ledges if l.y == 200], [])
+        self.assertTrue([l for l in ledges if l.y == 400])
+
+    def test_ignored_windows_still_visible_for_redaction(self):
+        # The pet ignoring a window must not hide it from screenshot redaction.
+        self.pet.tracker.set_ignored_windows(["window a"])
+        self.refresh()
+        titles = [w.title for w in self.pet.tracker.get_windows()]
+        self.assertIn("Window A", titles)
+
+    def test_ignored_windows_have_no_climb_edges(self):
+        self.pet.tracker.set_ignored_windows(["window a"])
+        self.refresh()
+        edges = [e for e in self.pet.tracker.get_climbable_edges()
+                 if not e.is_screen_edge]
+        self.assertEqual([e for e in edges if e.x in (100, 500)], [])
+
+    def test_ignores_by_process_name(self):
+        ignore = self.pet.tracker.ignores
+        self.pet.tracker.set_ignored_windows(["code"])
+        window = wt.WindowInfo(title="anything", rect=(0, 0, 10, 10), process="Code")
+        self.assertTrue(ignore(window))
+        self.pet.tracker.set_ignored_windows([])
+        self.assertFalse(ignore(window))
+
+
+class TestPersonalityEditor(PetHarness):
+    def test_set_and_clear_prompt(self):
+        import tempfile
+
+        import ai_companion
+
+        saved_path = ai_companion.CONFIG_PATH
+        tmp = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+        tmp.close()
+        self.addCleanup(lambda: os.path.exists(tmp.name) and os.unlink(tmp.name))
+        ai_companion.CONFIG_PATH = tmp.name
+        self.addCleanup(lambda: setattr(ai_companion, "CONFIG_PATH", saved_path))
+
+        self.assertTrue(ai_companion.set_system_prompt("cat", "be a lizard."))
+        self.assertEqual(ai_companion.get_system_prompt("cat"), "be a lizard.")
+        with open(tmp.name) as handle:
+            stored = json.load(handle)
+        self.assertEqual(stored["companions"]["cat"]["system_prompt"], "be a lizard.")
+        # Applied immediately, without a restart.
+        self.assertIn("be a lizard", ai_companion._system_prompt("cat"))
+
+        # Clearing falls back to the default prompt.
+        self.assertTrue(ai_companion.set_system_prompt("cat", "   "))
+        self.assertEqual(ai_companion.get_system_prompt("cat"), "")
+        self.assertNotIn("be a lizard", ai_companion._system_prompt("cat"))
+
+    def test_saving_personality_does_not_clobber_other_config(self):
+        import tempfile
+
+        import ai_companion
+
+        saved_path = ai_companion.CONFIG_PATH
+        tmp = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+        tmp.close()
+        self.addCleanup(lambda: os.path.exists(tmp.name) and os.unlink(tmp.name))
+        ai_companion.CONFIG_PATH = tmp.name
+        self.addCleanup(lambda: setattr(ai_companion, "CONFIG_PATH", saved_path))
+        self.addCleanup(ai_companion.set_system_prompt, "cat", "")
+
+        ai_companion.set_system_prompt("cat", "be a lizard.")
+        with open(tmp.name) as handle:
+            stored = json.load(handle)
+        self.assertIn("screenshots", stored)
+        self.assertIn("rate_limits", stored)
+        self.assertIn("memory", stored)
+
+
+class TestManualCapture(PetHarness):
+    def _capture(self, thread_cls):
+        with patch("pet.screen_capture.prepare_capture") as prepare:
+            prepare.return_value = (MagicMock(), "")
+            with patch("pet.ai_companion.screenshot_slot_ok") as slot:
+                with patch("pet.ai_companion.reserve_forced_screenshot") as reserve:
+                    with patch("pet.ai_companion.ai_enabled", return_value=True):
+                        with patch("pet.threading.Thread", thread_cls):
+                            self.pet.maybe_screenshot(force=True)
+        return prepare, slot, reserve
+
+    def test_manual_capture_works_with_screenshots_disabled(self):
+        # The automatic feature is off by default, but "Look At This" is a
+        # direct request and must still work.
+        import ai_companion
+
+        self.assertFalse(ai_companion.screenshot_settings()["enabled"])
+        captured = {}
+
+        class FakeThread:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+            def start(self):
+                pass
+
+        prepare, slot, reserve = self._capture(FakeThread)
+        prepare.assert_called_once()
+        slot.assert_not_called()
+        reserve.assert_called_once()
+        self.assertIn("target", captured)
+
+    def test_manual_capture_without_ai_does_not_grab(self):
+        with patch("pet.screen_capture.prepare_capture") as prepare:
+            with patch("pet.ai_companion.ai_enabled", return_value=False):
+                self.pet.maybe_screenshot(force=True)
+        prepare.assert_not_called()
+
+    def test_manual_capture_still_respects_the_blocklist(self):
+        with patch("pet.screen_capture.prepare_capture") as prepare:
+            prepare.return_value = (None, "focused window matches the blocklist")
+            with patch("pet.ai_companion.ai_enabled", return_value=True):
+                with patch("pet.ai_companion.reserve_forced_screenshot"):
+                    with patch("pet.ai_companion.record_capture_attempt") as record:
+                        with patch.object(self.pet, "_speak_contextual") as speak:
+                            self.pet.maybe_screenshot(force=True)
+        speak.assert_called_once_with("screenshot_blocked")
+        self.assertTrue(record.called)
+        self.assertFalse(record.call_args[0][0], "a refused capture must not count")
+
+
+class TestLongRunInvariants(PetHarness):
+    def test_random_input_keeps_every_invariant(self):
+        """A long randomised run: no crash, no floating, no illegal perch."""
+        import random
+
+        random.seed(20260928)
+        cursor = QPoint(600, 400)
+        self.pet.load_skin("cat")
+        self.apply_screen()
+        self.refresh()
+        self.pet.energy = 100.0
+        self.pet.allow_jump = True
+        self.pet.allow_chase = True
+
+        states = {}
+        for tick in range(6000):
+            if tick % 5 == 0:
+                cursor = QPoint(random.randint(-20, 1300), random.randint(-20, 740))
+            if tick % 401 == 0:
+                self.pet.mousePressEvent(
+                    MagicMock(button=lambda: Qt.LeftButton,
+                              globalPos=lambda: QPoint(300, 300)))
+                self.pet.mouseMoveEvent(
+                    MagicMock(buttons=lambda: Qt.LeftButton,
+                              globalPos=lambda: cursor))
+                self.pet.mouseReleaseEvent(
+                    MagicMock(button=lambda: Qt.LeftButton,
+                              globalPos=lambda: cursor))
+            if tick % 601 == 0:
+                self.pet.energy = random.choice([5.0, 55.0, 100.0])
+
+            with patch("pet.QCursor", MagicMock(pos=MagicMock(return_value=cursor))):
+                self.pet.game_loop()
+
+            states[self.pet.state] = states.get(self.pet.state, 0) + 1
+            self.assertIn(self.pet.state, set(P.FRAME_SPEED) | {"IDLE"},
+                          "unknown state %s" % self.pet.state)
+            if self.pet.state == "PERCH":
+                self.assertIsNotNone(self.pet.current_ledge)
+                self.assertFalse(self.pet.current_ledge.is_floor)
+                self.assertAlmostEqual(
+                    self.pet.y_pos, self.pet.current_ledge.y - self.pet.sprite_h,
+                    delta=2.0, msg="perched but not on the ledge")
+            if self.pet.state in ("SIT", "IDLE", "WALK", "STALK", "RUN", "CHASE",
+                                  "SWAT", "BLINK", "GROOM", "SLEEP", "SWAT"):
+                if not self.pet._is_on_ledge() and not self.pet.is_ghost:
+                    self.assertAlmostEqual(
+                        self.pet.y_pos, self.pet.floor_y, delta=12.0,
+                        msg="%s floating at %.1f" % (self.pet.state, self.pet.y_pos))
+            self.assertGreaterEqual(self.pet.x_pos, self.pet.screen_left - 1)
+            self.assertLessEqual(self.pet.x_pos,
+                                 self.pet.screen_left + self.pet.screen_w)
+            self.assertGreaterEqual(self.pet.energy, 0.0)
+            self.assertLessEqual(self.pet.energy, 100.0)
+        # A run this long should have exercised more than sitting still.
+        self.assertGreaterEqual(len(states), 4, "only saw %s" % sorted(states))
 
 
 if __name__ == "__main__":
