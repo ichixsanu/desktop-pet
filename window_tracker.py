@@ -1,21 +1,25 @@
-"""Window Tracker Module for Desktop Pets.
+"""Window tracking for the desktop pet.
 
-Provides a robust, lightweight, cross-platform window tracking system:
-- Windows: Uses ctypes (user32, dwmapi) to find visible, unminimized,
-  uncloaked windows with valid titles and bounding rects. Identifies
-  taskbars (Shell_TrayWnd) and filters zero-size, transparent, or cloaked windows.
-- Linux: Uses python-xlib (when available). Filters desktop windows, panels,
-  and minimized windows (_NET_WM_STATE_HIDDEN). Handles dynamic window closing
-  gracefully with BadWindow catching and safe coordinate translation.
-- Fallback: Gracefully handles Wayland, headless, or unsupported systems by
-  returning safe defaults without throwing exceptions or crashing.
-- Caching: Efficiently caches window queries for a configurable interval (1.5 - 2.0s)
-  so heavy OS operations never run on every animation frame.
-- Pet Helpers:
-    * get_walkable_ledges(screen_rect)
-    * get_climbable_edges(screen_rect)
-    * find_landing_y(x, y, sprite_w, sprite_h, floor_y)
-    * find_nearby_climbable(pet_x, pet_y, sprite_w, sprite_h, reach_px)
+One implementation, three consumers: the pet's physics (ledges, edges,
+landing), the contextual dialogue (what window is focused), and screenshot
+redaction. Everything is cached, and the OS query can be pushed onto a
+background thread so the GUI never blocks on an X11/Win32 round trip.
+
+Platform notes:
+- Windows: ctypes (user32 + dwmapi). Skips minimized, cloaked, invisible,
+  transparent and desktop windows. DWM extended frame bounds are used for
+  the rect so the pet perches on the visible titlebar, not the shadow.
+- Linux: python-xlib, when available. Prefers `_NET_WM_NAME` over the legacy
+  `WM_NAME` (modern GTK4/Qt/Electron windows only set the former, and
+  reading only `WM_NAME` is why window-aware dialogue was dead on Linux).
+- Wayland: cannot be enumerated by design. `detection_is_complete()` returns
+  False for any Wayland session so privacy-sensitive callers can fail
+  closed instead of believing they filtered something they never saw.
+
+Coordinate space: OS window APIs report native pixels, Qt reports logical
+pixels. On a HiDPI display those differ by `devicePixelRatio`, so the pet
+calls `set_coordinate_scale()` once at startup and every rect is converted
+into Qt's space here. Everything above this module is Qt-logical.
 """
 
 from __future__ import annotations
@@ -23,13 +27,13 @@ from __future__ import annotations
 import os
 import sys
 import time
+import threading
 from dataclasses import dataclass
 from typing import Any, List, NamedTuple, Optional, Sequence, Tuple, Union
 
 IS_WIN = sys.platform.startswith("win")
 IS_LINUX = sys.platform.startswith("linux")
 
-# Optional psutil for process inspection
 try:
     import psutil
 except Exception:
@@ -37,7 +41,7 @@ except Exception:
 
 
 def _get_process_name(pid: Optional[int]) -> str:
-    """Safely get process name from PID."""
+    """Safely get a process name from a PID."""
     if not psutil or not pid:
         return ""
     try:
@@ -47,19 +51,17 @@ def _get_process_name(pid: Optional[int]) -> str:
 
 
 # =====================================================================
-# Data Structures
+# Data structures
 # =====================================================================
 
 @dataclass
 class WindowInfo:
-    """Represents detected window information."""
-    id: Union[int, str]
-    title: str
-    rect: Tuple[int, int, int, int]  # (left, top, right, bottom)
+    """A window the pet can see. Rect is (left, top, right, bottom)."""
+    id: Union[int, str] = 0
+    title: str = ""
+    rect: Tuple[int, int, int, int] = (0, 0, 0, 0)
     process: str = ""
-    is_taskbar: bool = False
-    is_minimized: bool = False
-    is_visible: bool = True
+    pid: int = 0
 
     @property
     def left(self) -> int:
@@ -85,27 +87,9 @@ class WindowInfo:
     def height(self) -> int:
         return max(0, self.rect[3] - self.rect[1])
 
-    def __getitem__(self, item: str) -> Any:
-        """Allow dict-like indexing for backward compatibility."""
-        if item == "id":
-            return self.id
-        elif item == "title":
-            return self.title
-        elif item == "rect":
-            return self.rect
-        elif item == "process":
-            return self.process
-        elif item == "is_taskbar":
-            return self.is_taskbar
-        elif item == "is_minimized":
-            return self.is_minimized
-        elif item == "is_visible":
-            return self.is_visible
-        raise KeyError(item)
-
 
 class WalkableLedge(NamedTuple):
-    """Horizontal surface segment (y, x_min, x_max)."""
+    """Horizontal surface segment the pet can stand on."""
     y: int
     x_min: int
     x_max: int
@@ -116,9 +100,20 @@ class WalkableLedge(NamedTuple):
     def width(self) -> int:
         return max(0, self.x_max - self.x_min)
 
+    def holds_center(self, center_x: float) -> bool:
+        return self.x_min <= center_x <= self.x_max
+
+    def holds_any(self, left: float, right: float) -> bool:
+        """True when [left, right] overlaps the ledge horizontally."""
+        return min(right, self.x_max) - max(left, self.x_min) > 0
+
 
 class ClimbableEdge(NamedTuple):
-    """Vertical climbable segment (x, y_bottom, y_top, is_left_edge)."""
+    """Vertical segment the pet can climb.
+
+    `is_left_edge` is True for a window's left border (its inside is to the
+    right), False for its right border.
+    """
     x: int
     y_bottom: int
     y_top: int
@@ -131,21 +126,36 @@ class ClimbableEdge(NamedTuple):
         return max(0, self.y_bottom - self.y_top)
 
 
+class WindowSnapshot(NamedTuple):
+    """One coherent view of the desktop, computed once per poll."""
+    windows: List[WindowInfo]
+    taskbar: Optional[Tuple[int, int, int, int]]
+    ledges: List[WalkableLedge]
+    edges: List[ClimbableEdge]
+    screen_rect: Optional[Tuple[int, int, int, int]]
+    at: float
+    detection_works: bool
+    active: Optional[WindowInfo] = None
+    detection_complete: bool = False
+
+
 # =====================================================================
-# Windows Backend (ctypes)
+# Windows backend (ctypes)
 # =====================================================================
 
 import ctypes
 from ctypes import wintypes
 
-# Win32 Constants (safe to declare on any platform)
 DWMWA_EXTENDED_FRAME_BOUNDS = 9
 DWMWA_CLOAKED = 14
 GWL_EXSTYLE = -20
 WS_EX_TRANSPARENT = 0x00000020
 WS_EX_LAYERED = 0x00080000
-WS_EX_TOOLWINDOW = 0x00000080
 LWA_ALPHA = 0x00000002
+
+MIN_WINDOW_WIDTH = 60
+MIN_WINDOW_HEIGHT = 50
+
 
 class _RECT(ctypes.Structure):
     _fields_ = [
@@ -156,8 +166,26 @@ class _RECT(ctypes.Structure):
     ]
 
 
-def _win32_list_windows(min_width: int = 50, min_height: int = 50) -> Tuple[List[WindowInfo], Optional[Tuple[int, int, int, int]]]:
-    """List uncloaked, visible, non-minimized Windows windows using ctypes."""
+def _win32_ex_style(hwnd) -> int:
+    """GetWindowLongPtrW on 64-bit, GetWindowLongW on 32-bit.
+
+    Coerced to int on purpose: a non-integer result would make every bit test
+    below truthy and silently filter out every window.
+    """
+    try:
+        if ctypes.sizeof(ctypes.c_void_p) == 8:
+            value = ctypes.windll.user32.GetWindowLongPtrW(hwnd, GWL_EXSTYLE)
+        else:
+            value = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+        return int(value) & 0xFFFFFFFF
+    except Exception:
+        return 0
+
+
+def _win32_list_windows(min_width: int = MIN_WINDOW_WIDTH,
+                        min_height: int = MIN_WINDOW_HEIGHT
+                        ) -> Tuple[List[WindowInfo], Optional[Tuple[int, int, int, int]]]:
+    """List uncloaked, visible, non-minimized top-level windows."""
     if not IS_WIN:
         return [], None
 
@@ -168,7 +196,6 @@ def _win32_list_windows(min_width: int = 50, min_height: int = 50) -> Tuple[List
         user32 = ctypes.windll.user32
         dwmapi = ctypes.windll.dwmapi
 
-        # Check main taskbar
         hwnd_taskbar = user32.FindWindowW("Shell_TrayWnd", None)
         if hwnd_taskbar and user32.IsWindowVisible(hwnd_taskbar):
             tb_rect = _RECT()
@@ -179,18 +206,13 @@ def _win32_list_windows(min_width: int = 50, min_height: int = 50) -> Tuple[List
         WINFUNCTYPE = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)
         EnumWindowsProc = WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
 
-        def enum_cb(hwnd: int, _lparam: int) -> bool:
-            nonlocal taskbar_rect
+        def enum_cb(hwnd, _lparam) -> bool:
             try:
-                # 1. Must be a valid visible window
                 if not user32.IsWindowVisible(hwnd):
                     return True
-
-                # 2. Must not be minimized (iconic)
                 if user32.IsIconic(hwnd):
                     return True
 
-                # 3. Check window title
                 length = user32.GetWindowTextLengthW(hwnd)
                 if length == 0:
                     return True
@@ -200,14 +222,21 @@ def _win32_list_windows(min_width: int = 50, min_height: int = 50) -> Tuple[List
                 if not title or title == "Program Manager":
                     return True
 
-                # 4. Check class name for taskbars and shell desktop
                 cls_buf = ctypes.create_unicode_buffer(256)
                 user32.GetClassNameW(hwnd, cls_buf, 256)
                 cls_name = cls_buf.value
                 if cls_name in ("Progman", "WorkerW"):
                     return True
 
-                # 5. Check cloaked status (Windows 8+)
+                if cls_name in ("Shell_TrayWnd", "Shell_SecondaryTrayWnd"):
+                    rect = _RECT()
+                    user32.GetWindowRect(hwnd, ctypes.byref(rect))
+                    if rect.right > rect.left and rect.bottom > rect.top:
+                        if taskbar_rect is None:
+                            taskbar_rect = (rect.left, rect.top, rect.right, rect.bottom)
+                    return True
+
+                # Cloaked (Windows 8+ virtual desktop, UWP splash)
                 cloaked = ctypes.c_int(0)
                 try:
                     hr = dwmapi.DwmGetWindowAttribute(
@@ -218,12 +247,12 @@ def _win32_list_windows(min_width: int = 50, min_height: int = 50) -> Tuple[List
                 except Exception:
                     pass
 
-                # 6. Check extended styles (layered transparent windows)
-                try:
-                    ex_style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-                    if ex_style & WS_EX_TRANSPARENT:
-                        return True
-                    if ex_style & WS_EX_LAYERED:
+                # Click-through and fully transparent windows
+                ex_style = _win32_ex_style(hwnd)
+                if ex_style & WS_EX_TRANSPARENT:
+                    return True
+                if ex_style & WS_EX_LAYERED:
+                    try:
                         cr_key = wintypes.COLORREF()
                         alpha = wintypes.BYTE()
                         flags = wintypes.DWORD()
@@ -232,10 +261,9 @@ def _win32_list_windows(min_width: int = 50, min_height: int = 50) -> Tuple[List
                         ):
                             if (flags.value & LWA_ALPHA) and alpha.value == 0:
                                 return True
-                except Exception:
-                    pass
+                    except Exception:
+                        pass
 
-                # 7. Get window bounding rect (prefer DWM extended frame bounds)
                 rect = _RECT()
                 hr = -1
                 try:
@@ -244,43 +272,22 @@ def _win32_list_windows(min_width: int = 50, min_height: int = 50) -> Tuple[List
                     )
                 except Exception:
                     pass
-
                 if hr != 0:
                     user32.GetWindowRect(hwnd, ctypes.byref(rect))
 
                 left, top, right, bottom = rect.left, rect.top, rect.right, rect.bottom
-                width = right - left
-                height = bottom - top
-
-                # 8. Filter zero or tiny size
-                if width <= 0 or height <= 0:
+                if right - left <= 0 or bottom - top <= 0:
                     return True
-
-                # If it's a taskbar window
-                is_taskbar = cls_name in ("Shell_TrayWnd", "Shell_SecondaryTrayWnd")
-                if is_taskbar:
-                    if taskbar_rect is None:
-                        taskbar_rect = (left, top, right, bottom)
-                    return True
-
-                if width < min_width or height < min_height:
+                if right - left < min_width or bottom - top < min_height:
                     return True
 
                 pid = wintypes.DWORD()
                 user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-                proc = _get_process_name(pid.value)
-
-                windows.append(
-                    WindowInfo(
-                        id=hwnd,
-                        title=title,
-                        rect=(left, top, right, bottom),
-                        process=proc,
-                        is_taskbar=False,
-                        is_minimized=False,
-                        is_visible=True,
-                    )
-                )
+                windows.append(WindowInfo(
+                    id=int(hwnd), title=title,
+                    rect=(left, top, right, bottom),
+                    process=_get_process_name(pid.value), pid=int(pid.value),
+                ))
             except Exception:
                 pass
             return True
@@ -292,50 +299,103 @@ def _win32_list_windows(min_width: int = 50, min_height: int = 50) -> Tuple[List
     return windows, taskbar_rect
 
 
+def _win32_active_window() -> Optional[WindowInfo]:
+    """The focused window, or None."""
+    if not IS_WIN:
+        return None
+    try:
+        user32 = ctypes.windll.user32
+        hwnd = user32.GetForegroundWindow()
+        if not hwnd:
+            return None
+        length = user32.GetWindowTextLengthW(hwnd)
+        buf = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(hwnd, buf, length + 1)
+        title = buf.value.strip()
+        if not title:
+            return None
+        rect = _RECT()
+        user32.GetWindowRect(hwnd, ctypes.byref(rect))
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        return WindowInfo(
+            id=int(hwnd), title=title,
+            rect=(rect.left, rect.top, rect.right, rect.bottom),
+            process=_get_process_name(pid.value), pid=int(pid.value),
+        )
+    except Exception:
+        return None
+
+
 # =====================================================================
-# Linux Backend (Xlib + Wayland safe fallback)
+# Linux backend (Xlib, Wayland-safe)
 # =====================================================================
 
 _xlib_display = None
 _xlib_init_attempted = False
+_xlib_lock = threading.Lock()
 
 
 def _get_xlib():
-    """Lazily initialize and return Xlib display, or None if unavailable/Wayland."""
+    """Lazily connect to the X server, or return None.
+
+    Never called from the GUI thread once the background poller is running.
+    """
     global _xlib_display, _xlib_init_attempted
-    if _xlib_init_attempted:
+    with _xlib_lock:
+        if _xlib_init_attempted:
+            return _xlib_display
+        _xlib_init_attempted = True
+        if not IS_LINUX:
+            return None
+        if not os.environ.get("DISPLAY") and os.environ.get("WAYLAND_DISPLAY"):
+            return None
+        try:
+            from Xlib import display as xdisplay
+            _xlib_display = xdisplay.Display()
+        except Exception:
+            _xlib_display = None
         return _xlib_display
 
-    _xlib_init_attempted = True
-    if not IS_LINUX:
-        _xlib_display = None
-        return None
 
-    # Check for headless or pure Wayland without DISPLAY
-    display_env = os.environ.get("DISPLAY")
-    if not display_env and os.environ.get("WAYLAND_DISPLAY"):
-        _xlib_display = None
-        return None
-
-    try:
-        from Xlib import display
-        _xlib_display = display.Display()
-    except Exception:
-        _xlib_display = None
-
-    return _xlib_display
+def wayland_session() -> bool:
+    """True in any Wayland session (native or XWayland hybrid)."""
+    return bool(os.environ.get("WAYLAND_DISPLAY"))
 
 
-def safe_translate_coords(root_window, client_window, x: int = 0, y: int = 0) -> Optional[Tuple[int, int]]:
-    """Safely translate client_window (x, y) coordinates to root window space.
+def _detection_is_complete() -> bool:
+    """Whether we can see *every* window on the desktop.
 
-    Handles Xlib.error.BadWindow, BadDrawable, and general exceptions gracefully
-    when windows close dynamically.
+    Wayland deliberately hides other clients' windows from ordinary
+    applications. Under XWayland we can still see X clients, which is worse
+    than useless for privacy: the caller believes it filtered the desktop
+    when native Wayland windows were never listed at all. So any Wayland
+    session reports incomplete and privacy-sensitive callers must refuse.
     """
+    if IS_WIN:
+        return True
+    if wayland_session():
+        return False
+    if IS_LINUX:
+        return _get_xlib() is not None
+    return False
+
+def window_detection_available() -> bool:
+    """Whether any OS window query works (subset of the desktop is fine)."""
+    if IS_WIN:
+        return True
+    if IS_LINUX:
+        return _get_xlib() is not None
+    return False
+
+
+def safe_translate_coords(root_window, client_window, x: int = 0, y: int = 0
+                          ) -> Optional[Tuple[int, int]]:
+    """Translate client_window coordinates into root space, tolerating windows
+    that closed mid-query (BadWindow / BadDrawable)."""
     if root_window is None or client_window is None:
         return None
     try:
-        # In python-xlib: root.translate_coords(client, x, y) translates (x, y) in client to root
         coords = root_window.translate_coords(client_window, x, y)
         if coords is not None:
             return (coords.x, coords.y)
@@ -344,12 +404,82 @@ def safe_translate_coords(root_window, client_window, x: int = 0, y: int = 0) ->
     return None
 
 
-def _linux_list_windows(min_width: int = 50, min_height: int = 50) -> Tuple[List[WindowInfo], Optional[Tuple[int, int, int, int]]]:
-    """List visible, non-desktop Linux windows using Xlib with Wayland safe fallback."""
+# X11 atoms used by the tracker, interned once per refresh. Interning per
+# window was an extra server round trip each time; and the display attached to
+# a resource object is a _BaseDisplay, which has no intern_atom at all, so the
+# atoms have to come from the real Display.
+_X11_ATOM_NAMES = (
+    "_NET_ACTIVE_WINDOW",
+    "_NET_CLIENT_LIST",
+    "_NET_CLIENT_LIST_STACKING",
+    "_NET_FRAME_EXTENTS",
+    "_NET_WM_NAME",
+    "_NET_WM_PID",
+    "_NET_WM_STATE",
+    "_NET_WM_STATE_HIDDEN",
+    "_NET_WM_WINDOW_TYPE",
+    "_NET_WM_WINDOW_TYPE_DESKTOP",
+    "_NET_WM_WINDOW_TYPE_DOCK",
+    "_NET_WM_WINDOW_TYPE_NOTIFICATION",
+    "_NET_WM_WINDOW_TYPE_SPLASH",
+    "_NET_WM_WINDOW_TYPE_TOOLTIP",
+    "_NET_WORKAREA",
+)
+
+
+def _intern_atoms(display) -> dict:
+    atoms = {}
+    for name in _X11_ATOM_NAMES:
+        try:
+            atoms[name] = display.intern_atom(name)
+        except Exception:
+            atoms[name] = 0
+    return atoms
+
+
+def _x11_window_name(win, atoms: dict) -> str:
+    """Title of an X window.
+
+    `_NET_WM_NAME` is the modern property and the only one set by GTK4, Qt and
+    Electron; `get_wm_name()` reads the legacy `WM_NAME` which is empty for
+    exactly those apps. Reading only WM_NAME is why window-aware dialogue and
+    the foreground blocklist never fired on Linux.
+    """
+    name = ""
+    try:
+        prop = win.get_full_property(atoms["_NET_WM_NAME"], 0)
+        if prop and prop.value:
+            val = prop.value
+            name = val.decode("utf-8", "replace") if isinstance(val, bytes) else str(val)
+    except Exception:
+        name = ""
+    if not name:
+        try:
+            name = win.get_wm_name() or ""
+        except Exception:
+            name = ""
+    if isinstance(name, bytes):
+        name = name.decode("utf-8", "replace")
+    return name.strip()
+
+
+def _x11_window_pid(win, atoms: dict) -> int:
+    try:
+        prop = win.get_full_property(atoms["_NET_WM_PID"], 0)
+        if prop and prop.value:
+            return int(prop.value[0])
+    except Exception:
+        pass
+    return 0
+
+
+def _linux_list_windows(min_width: int = MIN_WINDOW_WIDTH,
+                        min_height: int = MIN_WINDOW_HEIGHT
+                        ) -> Tuple[List[WindowInfo], Optional[Tuple[int, int, int, int]]]:
+    """List visible, non-desktop Linux windows."""
     d = _get_xlib()
     if not d:
         return [], None
-
     try:
         from Xlib import Xatom, error
     except Exception:
@@ -361,54 +491,46 @@ def _linux_list_windows(min_width: int = 50, min_height: int = 50) -> Tuple[List
     try:
         screen = d.screen()
         root = screen.root
+        atoms = _intern_atoms(d)
 
-        # Query workarea to check for panels/dock reservation
+        # Panels reserve space outside _NET_WORKAREA; the gap is the panel.
         try:
-            workarea_prop = root.get_full_property(d.intern_atom("_NET_WORKAREA"), Xatom.CARDINAL)
-            if workarea_prop and len(workarea_prop.value) >= 4:
-                wa_x, wa_y, wa_w, wa_h = workarea_prop.value[:4]
-                screen_h = screen.height_in_pixels
-                screen_w = screen.width_in_pixels
-                if wa_y + wa_h < screen_h:
-                    # Bottom panel exists
-                    taskbar_rect = (wa_x, wa_y + wa_h, wa_x + wa_w, screen_h)
+            workarea = root.get_full_property(atoms["_NET_WORKAREA"], Xatom.CARDINAL)
+            if workarea and len(workarea.value) >= 4:
+                wa_x, wa_y, wa_w, wa_h = workarea.value[:4]
+                if wa_y + wa_h < screen.height_in_pixels:
+                    taskbar_rect = (wa_x, wa_y + wa_h, wa_x + wa_w, screen.height_in_pixels)
         except Exception:
             pass
 
-        # Try _NET_CLIENT_LIST_STACKING (Z-order) or _NET_CLIENT_LIST
         client_prop = None
         for atom_name in ("_NET_CLIENT_LIST_STACKING", "_NET_CLIENT_LIST"):
             try:
-                atom = d.intern_atom(atom_name)
-                prop = root.get_full_property(atom, Xatom.WINDOW)
+                prop = root.get_full_property(atoms[atom_name], Xatom.WINDOW)
                 if prop and prop.value:
                     client_prop = prop
                     break
             except Exception:
                 continue
-
         if not client_prop:
             return [], taskbar_rect
 
-        atom_wm_state = d.intern_atom("_NET_WM_STATE")
-        atom_state_hidden = d.intern_atom("_NET_WM_STATE_HIDDEN")
-        atom_window_type = d.intern_atom("_NET_WM_WINDOW_TYPE")
-        atom_type_desktop = d.intern_atom("_NET_WM_WINDOW_TYPE_DESKTOP")
-        atom_type_dock = d.intern_atom("_NET_WM_WINDOW_TYPE_DOCK")
-        atom_type_splash = d.intern_atom("_NET_WM_WINDOW_TYPE_SPLASH")
-        atom_type_notification = d.intern_atom("_NET_WM_WINDOW_TYPE_NOTIFICATION")
-        atom_type_tooltip = d.intern_atom("_NET_WM_WINDOW_TYPE_TOOLTIP")
-        atom_frame_extents = d.intern_atom("_NET_FRAME_EXTENTS")
-        atom_wm_pid = d.intern_atom("_NET_WM_PID")
-        atom_net_wm_name = d.intern_atom("_NET_WM_NAME")
+        atom_wm_state = atoms["_NET_WM_STATE"]
+        atom_state_hidden = atoms["_NET_WM_STATE_HIDDEN"]
+        atom_window_type = atoms["_NET_WM_WINDOW_TYPE"]
+        atom_type_desktop = atoms["_NET_WM_WINDOW_TYPE_DESKTOP"]
+        atom_type_dock = atoms["_NET_WM_WINDOW_TYPE_DOCK"]
+        atom_type_splash = atoms["_NET_WM_WINDOW_TYPE_SPLASH"]
+        atom_type_notification = atoms["_NET_WM_WINDOW_TYPE_NOTIFICATION"]
+        atom_type_tooltip = atoms["_NET_WM_WINDOW_TYPE_TOOLTIP"]
+        atom_frame_extents = atoms["_NET_FRAME_EXTENTS"]
 
         for wid in client_prop.value:
             try:
-                w = d.create_resource_object("window", wid)
+                win = d.create_resource_object("window", wid)
 
-                # Check window state for _NET_WM_STATE_HIDDEN (minimized)
                 try:
-                    state_prop = w.get_full_property(atom_wm_state, Xatom.ATOM)
+                    state_prop = win.get_full_property(atom_wm_state, Xatom.ATOM)
                     if state_prop and atom_state_hidden in state_prop.value:
                         continue
                 except (error.BadWindow, error.BadDrawable, error.XError):
@@ -416,54 +538,39 @@ def _linux_list_windows(min_width: int = 50, min_height: int = 50) -> Tuple[List
                 except Exception:
                     pass
 
-                # Check window type
                 is_dock = False
                 try:
-                    type_prop = w.get_full_property(atom_window_type, Xatom.ATOM)
+                    type_prop = win.get_full_property(atom_window_type, Xatom.ATOM)
                     if type_prop and type_prop.value:
                         tvals = set(type_prop.value)
                         if atom_type_desktop in tvals:
-                            continue  # Skip desktop background
-                        if atom_type_splash in tvals or atom_type_notification in tvals or atom_type_tooltip in tvals:
                             continue
-                        if atom_type_dock in tvals:
-                            is_dock = True
+                        if atom_type_splash in tvals or atom_type_notification in tvals \
+                                or atom_type_tooltip in tvals:
+                            continue
+                        is_dock = atom_type_dock in tvals
                 except (error.BadWindow, error.BadDrawable, error.XError):
                     continue
                 except Exception:
                     pass
 
-                # Check title
-                name = ""
-                try:
-                    name_prop = w.get_full_property(atom_net_wm_name, 0)
-                    if name_prop and name_prop.value:
-                        val = name_prop.value
-                        name = val.decode("utf-8", errors="replace") if isinstance(val, bytes) else str(val)
-                    if not name:
-                        name = w.get_wm_name() or ""
-                except Exception:
-                    name = ""
-
-                name = name.strip()
+                name = _x11_window_name(win, atoms)
                 if not name and not is_dock:
                     continue
 
-                # Geometry and safe coordinates translation
                 try:
-                    geom = w.get_geometry()
+                    geom = win.get_geometry()
                 except (error.BadWindow, error.BadDrawable, error.XError):
                     continue
 
-                coords = safe_translate_coords(root, w, 0, 0)
+                coords = safe_translate_coords(root, win, 0, 0)
                 if coords is None:
                     continue
                 cx, cy = coords
 
-                # Check frame extents (titlebar and window border margins)
                 frame_ext = [0, 0, 0, 0]  # left, right, top, bottom
                 try:
-                    fprop = w.get_full_property(atom_frame_extents, Xatom.CARDINAL)
+                    fprop = win.get_full_property(atom_frame_extents, Xatom.CARDINAL)
                     if fprop and fprop.value and len(fprop.value) >= 4:
                         frame_ext = list(fprop.value[:4])
                 except Exception:
@@ -473,59 +580,132 @@ def _linux_list_windows(min_width: int = 50, min_height: int = 50) -> Tuple[List
                 top = cy - frame_ext[2]
                 right = cx + geom.width + frame_ext[1]
                 bottom = cy + geom.height + frame_ext[3]
-                width = right - left
-                height = bottom - top
-
-                if width <= 0 or height <= 0:
+                if right - left <= 0 or bottom - top <= 0:
                     continue
 
                 if is_dock:
-                    # Panel or dock
                     if cy > screen.height_in_pixels // 2:
                         taskbar_rect = (left, top, right, bottom)
                     continue
 
-                if width < min_width or height < min_height:
+                if right - left < min_width or bottom - top < min_height:
                     continue
 
-                # Process name
-                proc = ""
-                try:
-                    pid_prop = w.get_full_property(atom_wm_pid, 0)
-                    if pid_prop and pid_prop.value:
-                        proc = _get_process_name(pid_prop.value[0])
-                except Exception:
-                    pass
-
-                windows.append(
-                    WindowInfo(
-                        id=wid,
-                        title=name,
-                        rect=(left, top, right, bottom),
-                        process=proc,
-                        is_taskbar=False,
-                        is_minimized=False,
-                        is_visible=True,
-                    )
-                )
+                pid = _x11_window_pid(win, atoms)
+                windows.append(WindowInfo(
+                    id=int(wid), title=name, rect=(left, top, right, bottom),
+                    process=_get_process_name(pid), pid=pid,
+                ))
             except (error.BadWindow, error.BadDrawable, error.XError):
                 continue
             except Exception:
                 continue
-
     except Exception:
         return [], taskbar_rect
 
     return windows, taskbar_rect
 
 
+def _linux_active_window() -> Optional[WindowInfo]:
+    """The focused window per `_NET_ACTIVE_WINDOW`, or None."""
+    d = _get_xlib()
+    if not d:
+        return None
+    try:
+        from Xlib import Xatom
+    except Exception:
+        return None
+    try:
+        root = d.screen().root
+        atoms = _intern_atoms(d)
+        prop = root.get_full_property(atoms["_NET_ACTIVE_WINDOW"], 0)
+        if not prop or not prop.value:
+            return None
+        win = d.create_resource_object("window", prop.value[0])
+        title = _x11_window_name(win, atoms)
+        if not title:
+            return None
+        geom = win.get_geometry()
+        coords = safe_translate_coords(root, win, 0, 0) or (0, 0)
+        pid = _x11_window_pid(win, atoms)
+        return WindowInfo(
+            id=int(prop.value[0]), title=title,
+            rect=(coords[0], coords[1], coords[0] + geom.width, coords[1] + geom.height),
+            process=_get_process_name(pid), pid=pid,
+        )
+    except Exception:
+        return None
+
+
 # =====================================================================
-# Screen Geometry Helper
+# Screen geometry
 # =====================================================================
 
+def _qt_virtual_geometry() -> Optional[Tuple[int, int, int, int]]:
+    """Union of all monitors, in Qt logical pixels."""
+    try:
+        if "PyQt5.QtWidgets" in sys.modules:
+            from PyQt5.QtWidgets import QApplication
+            app = QApplication.instance()
+            if app:
+                screens = app.screens()
+                if not screens:
+                    return None
+                rects = [s.geometry() for s in screens]
+                left = min(r.left() for r in rects)
+                top = min(r.top() for r in rects)
+                right = max(r.right() for r in rects)
+                bottom = max(r.bottom() for r in rects)
+                return (left, top, right, bottom)
+    except Exception:
+        pass
+    return None
+
+
+def _win32_virtual_geometry() -> Optional[Tuple[int, int, int, int]]:
+    if not IS_WIN:
+        return None
+    try:
+        SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN = 78, 79
+        SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN = 76, 77
+        user32 = ctypes.windll.user32
+        w = user32.GetSystemMetrics(SM_CXVIRTUALSCREEN)
+        h = user32.GetSystemMetrics(SM_CYVIRTUALSCREEN)
+        x = user32.GetSystemMetrics(SM_XVIRTUALSCREEN)
+        y = user32.GetSystemMetrics(SM_YVIRTUALSCREEN)
+        if w > 0 and h > 0:
+            return (x, y, x + w, y + h)
+    except Exception:
+        pass
+    return None
+
+
+def _x11_virtual_geometry() -> Optional[Tuple[int, int, int, int]]:
+    if not IS_LINUX:
+        return None
+    try:
+        d = _get_xlib()
+        if d:
+            root_geom = d.screen().root.get_geometry()
+            return (0, 0, root_geom.width, root_geom.height)
+    except Exception:
+        pass
+    return None
+
+
+def virtual_screen_rect() -> Optional[Tuple[int, int, int, int]]:
+    """(left, top, right, bottom) covering every monitor.
+
+    Note this is the *virtual desktop*, not the primary screen: on a second
+    monitor the primary screen's origin is not (0, 0), and mixing the two
+    coordinate spaces is how the pet ends up walking off its own floor.
+    """
+    return (_qt_virtual_geometry() or _win32_virtual_geometry()
+            or _x11_virtual_geometry())
+
+
+# Kept for callers that specifically want the primary display.
 def _get_primary_screen_geometry() -> Optional[Tuple[int, int, int, int]]:
-    """Get primary screen geometry as (0, 0, width, height) if possible."""
-    # 1. Try PyQt5 if loaded
     try:
         if "PyQt5.QtWidgets" in sys.modules:
             from PyQt5.QtWidgets import QApplication
@@ -533,48 +713,34 @@ def _get_primary_screen_geometry() -> Optional[Tuple[int, int, int, int]]:
             if app:
                 scr = app.primaryScreen()
                 if scr:
-                    geo = scr.geometry()
-                    return (geo.x(), geo.y(), geo.x() + geo.width(), geo.y() + geo.height())
+                    g = scr.geometry()
+                    return (g.x(), g.y(), g.x() + g.width(), g.y() + g.height())
     except Exception:
         pass
-
-    # 2. Try Windows
     if IS_WIN:
         try:
-            import ctypes
-            w = ctypes.windll.user32.GetSystemMetrics(0)
-            h = ctypes.windll.user32.GetSystemMetrics(1)
+            user32 = ctypes.windll.user32
+            w = user32.GetSystemMetrics(0)
+            h = user32.GetSystemMetrics(1)
             if w > 0 and h > 0:
                 return (0, 0, w, h)
         except Exception:
             pass
-
-    # 3. Try Linux Xlib
-    if IS_LINUX:
-        try:
-            d = _get_xlib()
-            if d:
-                scr = d.screen()
-                return (0, 0, scr.width_in_pixels, scr.height_in_pixels)
-        except Exception:
-            pass
-
-    return None
+    return _x11_virtual_geometry()
 
 
 def _normalize_screen_rect(rect: Any) -> Optional[Tuple[int, int, int, int]]:
-    """Normalize various screen rect representations to (left, top, right, bottom)."""
+    """Normalize QRect / x,y,w,h / (l,t,r,b) into (left, top, right, bottom)."""
     if rect is None:
-        return _get_primary_screen_geometry()
+        return virtual_screen_rect()
 
-    # Handle QRect or objects with left/top/right/bottom or x/y/width/height
-    if hasattr(rect, "left") and hasattr(rect, "right") and hasattr(rect, "top") and hasattr(rect, "bottom"):
+    if all(hasattr(rect, a) for a in ("left", "top", "right", "bottom")):
         try:
             return (int(rect.left()), int(rect.top()), int(rect.right()), int(rect.bottom()))
         except TypeError:
-            return (int(rect.left), int(rect.top), int(rect.right), int(rect.bottom()))
+            return (int(rect.left), int(rect.top), int(rect.right), int(rect.bottom))
 
-    if hasattr(rect, "x") and hasattr(rect, "y") and hasattr(rect, "width") and hasattr(rect, "height"):
+    if all(hasattr(rect, a) for a in ("x", "y", "width", "height")):
         try:
             x, y, w, h = int(rect.x()), int(rect.y()), int(rect.width()), int(rect.height())
         except TypeError:
@@ -588,367 +754,511 @@ def _normalize_screen_rect(rect: Any) -> Optional[Tuple[int, int, int, int]]:
 
 
 # =====================================================================
-# WindowTracker Class
+# WindowTracker
 # =====================================================================
 
 class WindowTracker:
-    """Lightweight, cached, cross-platform window tracker for desktop pets.
+    """Cached window/ledge/edge data for the pet.
 
-    Provides cached window listing, walkable ledges (including window titlebars
-    and screen floor/taskbar), climbable edges, landing calculation, and edge reach.
+    Read path (get_windows, get_walkable_ledges, ...) is a dict-free in-memory
+    read of the last snapshot, so it is safe and cheap to call at 20 Hz.
+    Write path (`_refresh`) is the only thing that talks to the OS; it runs on
+    a background thread once `start_background()` is called, or inline on the
+    calling thread while there is no poller.
     """
 
     def __init__(
         self,
         cache_interval: float = 1.5,
-        min_window_width: int = 60,
-        min_window_height: int = 50,
+        min_window_width: int = MIN_WINDOW_WIDTH,
+        min_window_height: int = MIN_WINDOW_HEIGHT,
         exclude_titles: Optional[Sequence[str]] = None,
+        exclude_pids: Optional[Sequence[int]] = None,
+        coordinate_scale: float = 1.0,
     ):
-        """Initialize the tracker.
-
-        Args:
-            cache_interval: Seconds to cache window listings (e.g. 1.5 - 2.0s)
-            min_window_width: Filter out windows smaller than this width
-            min_window_height: Filter out windows smaller than this height
-            exclude_titles: Optional list of window title substrings to exclude
-        """
         self.cache_interval = max(0.1, float(cache_interval))
         self.min_window_width = min_window_width
         self.min_window_height = min_window_height
-        self.exclude_titles = [t.lower() for t in (exclude_titles or [])]
+        self.exclude_titles = [t.lower() for t in (exclude_titles or []) if t]
+        self.exclude_pids = {int(p) for p in (exclude_pids or []) if p}
+        self.coordinate_scale = max(0.01, float(coordinate_scale))
 
+        self._screen_rect: Optional[Tuple[int, int, int, int]] = None
+        self._snapshot = WindowSnapshot([], None, [], [], None, 0.0, False, None, False)
+        self._lock = threading.RLock()
+        # Serialises the OS query itself. An Xlib Display is not thread-safe,
+        # so the poller and any inline refresh must never overlap.
+        self._query_lock = threading.Lock()
+        self._poller: Optional[threading.Thread] = None
+        self._stop = threading.Event()
+        self._wake = threading.Event()
+        self._background = False
+
+        # Legacy attributes, kept so existing tests and callers that poke the
+        # cache directly keep working.
         self._last_poll_time: float = 0.0
         self._cached_windows: List[WindowInfo] = []
         self._cached_taskbar: Optional[Tuple[int, int, int, int]] = None
 
+    # ---- configuration -------------------------------------------------
+
+    def set_coordinate_scale(self, scale: float) -> None:
+        """Convert OS-native rects into Qt logical pixels (HiDPI)."""
+        scale = max(0.01, float(scale))
+        if abs(scale - self.coordinate_scale) < 1e-6:
+            return
+        self.coordinate_scale = scale
+        self.invalidate_cache()
+
+    def set_screen_rect(self, rect: Any) -> None:
+        """Tell the tracker which display the pet is on, so ledges and edges
+        are built for that monitor instead of the whole virtual desktop."""
+        normalized = _normalize_screen_rect(rect)
+        with self._lock:
+            if normalized == self._screen_rect:
+                return
+            self._screen_rect = normalized
+        self.invalidate_cache()
+
+    def add_excluded_pid(self, pid: int) -> None:
+        """Stop the pet from seeing (and perching on) its own window."""
+        if pid:
+            with self._lock:
+                self.exclude_pids.add(int(pid))
+            self.invalidate_cache()
+
     def invalidate_cache(self) -> None:
-        """Force the next query to refresh window list from the OS."""
-        self._last_poll_time = 0.0
+        """Force the next query to re-read the OS.
+
+        While a background poller is running, readers never trigger their own
+        query, so an invalidation has to refresh inline or callers would keep
+        seeing the stale snapshot for up to a full poll interval -- which is
+        exactly when the caller needs the new geometry (a monitor was just
+        plugged in). The refresh is serialised against the poller, so this
+        stays a one-off cost on a rare event.
+        """
+        with self._lock:
+            self._last_poll_time = 0.0
+            self._snapshot = self._snapshot._replace(at=0.0)
+            background = self._background
+        if background:
+            self._wake.set()
+            try:
+                self._refresh(force=True)
+            except Exception:
+                pass
+
+    # ---- background polling --------------------------------------------
+
+    def start_background(self, interval: Optional[float] = None) -> None:
+        """Poll the OS on a worker thread so the GUI never blocks.
+
+        After this, read calls are guaranteed not to touch the OS: they return
+        the most recent snapshot, however old.
+        """
+        if self._poller is not None and self._poller.is_alive():
+            return
+        period = self.cache_interval if interval is None else max(0.1, float(interval))
+        self._stop.clear()
+        self._background = True
+
+        def loop():
+            while not self._stop.is_set():
+                try:
+                    self._refresh(force=True)
+                except Exception:
+                    pass
+                self._wake.wait(period)
+                self._wake.clear()
+
+        self._poller = threading.Thread(target=loop, name="window-poller", daemon=True)
+        self._poller.start()
+
+    def stop_background(self) -> None:
+        self._stop.set()
+        self._wake.set()
+        poller, self._poller = self._poller, None
+        self._background = False
+        if poller is not None and poller.is_alive():
+            poller.join(timeout=1.0)
+
+    # ---- refresh -------------------------------------------------------
+
+    def _scaled(self, rect: Tuple[int, int, int, int]) -> Tuple[int, int, int, int]:
+        if abs(self.coordinate_scale - 1.0) < 1e-6:
+            return rect
+        s = self.coordinate_scale
+        return (int(round(rect[0] / s)), int(round(rect[1] / s)),
+                int(round(rect[2] / s)), int(round(rect[3] / s)))
 
     def _query_os_windows(self) -> Tuple[List[WindowInfo], Optional[Tuple[int, int, int, int]]]:
-        """Query windows from OS with safe fallback."""
         try:
             if IS_WIN:
                 return _win32_list_windows(self.min_window_width, self.min_window_height)
-            elif IS_LINUX:
+            if IS_LINUX:
                 return _linux_list_windows(self.min_window_width, self.min_window_height)
         except Exception:
             pass
         return [], None
 
-    def get_windows(self, force_refresh: bool = False) -> List[WindowInfo]:
-        """Return list of active, visible, unminimized, uncloaked windows.
-
-        Uses cached results if called within cache_interval. Never raises exceptions.
-        """
+    def _refresh(self, force: bool = False) -> WindowSnapshot:
+        """Read the OS once and rebuild the whole snapshot."""
         now = time.monotonic()
-        if force_refresh or (now - self._last_poll_time >= self.cache_interval):
+        with self._lock:
+            fresh = (now - self._last_poll_time) < self.cache_interval
+
+        if fresh and not force:
+            with self._lock:
+                return self._snapshot
+
+        # One Xlib Display, one lock. The window listing and the active-window
+        # lookup must not interleave with another thread's use of it either,
+        # or the connection can wedge rather than merely return bad data.
+        with self._query_lock:
             raw_windows, taskbar = self._query_os_windows()
-            # Filter excluded titles
-            filtered = []
-            for w in raw_windows:
-                title_lower = w.title.lower()
-                if any(ex in title_lower for ex in self.exclude_titles):
-                    continue
-                filtered.append(w)
+            try:
+                active = _win32_active_window() if IS_WIN else (
+                    _linux_active_window() if IS_LINUX else None)
+            except Exception:
+                active = None
 
-            self._cached_windows = filtered
-            self._cached_taskbar = taskbar
-            self._last_poll_time = now
+        windows = []
+        for w in raw_windows:
+            if self.exclude_pids and w.pid in self.exclude_pids:
+                continue
+            if self.exclude_titles and any(t in w.title.lower() for t in self.exclude_titles):
+                continue
+            windows.append(WindowInfo(
+                id=w.id, title=w.title, rect=self._scaled(w.rect),
+                process=w.process, pid=w.pid,
+            ))
 
-        return list(self._cached_windows)
+        with self._lock:
+            self._last_poll_time = time.monotonic()
+            self._cached_windows = windows
+            self._cached_taskbar = self._scaled(taskbar) if taskbar else None
+            screen_rect = self._screen_rect or virtual_screen_rect()
+            self._snapshot = WindowSnapshot(
+                windows=windows,
+                taskbar=self._cached_taskbar,
+                ledges=self._build_ledges(windows, self._cached_taskbar, screen_rect),
+                edges=self._build_edges(windows, screen_rect, include_screen_edges=True),
+                screen_rect=screen_rect,
+                at=self._last_poll_time,
+                detection_works=window_detection_available(),
+                active=None if active is None else WindowInfo(
+                    id=active.id, title=active.title, rect=self._scaled(active.rect),
+                    process=active.process, pid=active.pid),
+                detection_complete=_detection_is_complete(),
+            )
+            return self._snapshot
 
-    def get_taskbar_rect(self, force_refresh: bool = False) -> Optional[Tuple[int, int, int, int]]:
-        """Return the bounding rect (left, top, right, bottom) of the taskbar/dock, if found."""
-        self.get_windows(force_refresh=force_refresh)
-        return self._cached_taskbar
+    def _ensure_snapshot(self, force_refresh: bool = False) -> WindowSnapshot:
+        with self._lock:
+            background = self._background
+        if background and not force_refresh:
+            # A poller owns the OS queries; do not race it or block the GUI.
+            with self._lock:
+                return self._snapshot
+        return self._refresh(force=force_refresh)
 
-    # -----------------------------------------------------------------
-    # Pet Helper 1: Walkable Ledges
-    # -----------------------------------------------------------------
-    def get_walkable_ledges(
-        self,
-        screen_rect: Any = None,
-        force_refresh: bool = False,
-    ) -> List[WalkableLedge]:
-        """Return horizontal segments (y, x_min, x_max) that the pet can sit or walk on.
+    # ---- geometry builders ---------------------------------------------
 
-        Includes window titlebars and the screen floor / taskbar.
-        """
-        s_rect = _normalize_screen_rect(screen_rect)
-        windows = self.get_windows(force_refresh=force_refresh)
-        taskbar = self._cached_taskbar
-
+    @staticmethod
+    def _build_ledges(windows, taskbar, screen_rect) -> List[WalkableLedge]:
         ledges: List[WalkableLedge] = []
 
-        # 1. Window titlebars (top edge)
         for w in windows:
-            top_y = w.top
-            left_x = w.left
-            right_x = w.right
-
-            if s_rect:
-                s_left, s_top, s_right, s_bottom = s_rect
-                # Skip windows entirely off-screen
-                if top_y < s_top or top_y >= s_bottom:
+            top_y, left_x, right_x = w.top, w.left, w.right
+            if screen_rect:
+                s_left, s_top, s_right, s_bottom = screen_rect
+                # Skip windows on another monitor entirely: a "ledge" the pet
+                # can never reach produces a phantom walkable surface.
+                if w.right <= s_left or w.left >= s_right or w.bottom <= s_top or w.top >= s_bottom:
                     continue
+                top_y = max(s_top, top_y)
                 left_x = max(s_left, left_x)
                 right_x = min(s_right, right_x)
+            if right_x - left_x >= 20:
+                ledges.append(WalkableLedge(y=top_y, x_min=left_x, x_max=right_x))
 
-            if right_x - left_x >= 20:  # Minimum walkable segment width
-                ledges.append(WalkableLedge(y=top_y, x_min=left_x, x_max=right_x, is_taskbar=False, is_floor=False))
-
-        # 2. Floor / Taskbar ledge
-        if s_rect:
-            s_left, s_top, s_right, s_bottom = s_rect
+        if screen_rect:
+            s_left, s_top, s_right, s_bottom = screen_rect
             if taskbar:
                 tb_left, tb_top, tb_right, tb_bottom = taskbar
-                # Taskbar along bottom of screen
-                if tb_top < s_bottom and tb_bottom >= s_bottom - 20:
-                    # Ledge on top of taskbar
+                if tb_top < s_bottom and tb_bottom >= s_bottom - 20 and tb_right > tb_left:
                     t_left = max(s_left, tb_left)
                     t_right = min(s_right, tb_right)
                     if t_right > t_left:
-                        ledges.append(WalkableLedge(y=tb_top, x_min=t_left, x_max=t_right, is_taskbar=True, is_floor=True))
-                    # Outside taskbar coverage if taskbar doesn't span whole screen width
+                        ledges.append(WalkableLedge(y=tb_top, x_min=t_left, x_max=t_right,
+                                                    is_taskbar=True, is_floor=True))
                     if t_left > s_left:
-                        ledges.append(WalkableLedge(y=s_bottom, x_min=s_left, x_max=t_left, is_taskbar=False, is_floor=True))
+                        ledges.append(WalkableLedge(y=s_bottom, x_min=s_left, x_max=t_left, is_floor=True))
                     if t_right < s_right:
-                        ledges.append(WalkableLedge(y=s_bottom, x_min=t_right, x_max=s_right, is_taskbar=False, is_floor=True))
+                        ledges.append(WalkableLedge(y=s_bottom, x_min=t_right, x_max=s_right, is_floor=True))
                 else:
-                    ledges.append(WalkableLedge(y=s_bottom, x_min=s_left, x_max=s_right, is_taskbar=False, is_floor=True))
+                    ledges.append(WalkableLedge(y=s_bottom, x_min=s_left, x_max=s_right, is_floor=True))
             else:
-                ledges.append(WalkableLedge(y=s_bottom, x_min=s_left, x_max=s_right, is_taskbar=False, is_floor=True))
+                ledges.append(WalkableLedge(y=s_bottom, x_min=s_left, x_max=s_right, is_floor=True))
 
-        # Sort ledges by elevation (top of screen / smallest y first)
         ledges.sort(key=lambda item: (item.y, item.x_min))
         return ledges
 
-    # -----------------------------------------------------------------
-    # Pet Helper 2: Climbable Edges
-    # -----------------------------------------------------------------
-    def get_climbable_edges(
-        self,
-        screen_rect: Any = None,
-        include_screen_edges: bool = True,
-        force_refresh: bool = False,
-    ) -> List[ClimbableEdge]:
-        """Return vertical segments (x, y_bottom, y_top, is_left_edge) of windows.
-
-        is_left_edge is True for the window's left border (inside is to the right),
-        and False for the window's right border (inside is to the left).
-        """
-        s_rect = _normalize_screen_rect(screen_rect)
-        windows = self.get_windows(force_refresh=force_refresh)
-
+    @staticmethod
+    def _build_edges(windows, screen_rect, include_screen_edges: bool = True) -> List[ClimbableEdge]:
         edges: List[ClimbableEdge] = []
 
         for w in windows:
-            left_x = w.left
-            right_x = w.right
-            top_y = w.top
-            bot_y = w.bottom
-
-            if s_rect:
-                s_left, s_top, s_right, s_bottom = s_rect
+            left_x, right_x, top_y, bot_y = w.left, w.right, w.top, w.bottom
+            if screen_rect:
+                s_left, s_top, s_right, s_bottom = screen_rect
+                # Same off-screen rule as ledges, so the pet never tries to
+                # climb a window on the other monitor.
+                if w.right <= s_left or w.left >= s_right or w.bottom <= s_top or w.top >= s_bottom:
+                    continue
                 top_y = max(s_top, top_y)
                 bot_y = min(s_bottom, bot_y)
-
             if bot_y - top_y >= 20:
-                # Left edge
-                edges.append(ClimbableEdge(x=left_x, y_bottom=bot_y, y_top=top_y, is_left_edge=True, is_screen_edge=False))
-                # Right edge
-                edges.append(ClimbableEdge(x=right_x, y_bottom=bot_y, y_top=top_y, is_left_edge=False, is_screen_edge=False))
+                edges.append(ClimbableEdge(x=left_x, y_bottom=bot_y, y_top=top_y, is_left_edge=True))
+                edges.append(ClimbableEdge(x=right_x, y_bottom=bot_y, y_top=top_y, is_left_edge=False))
 
-        if include_screen_edges and s_rect:
-            s_left, s_top, s_right, s_bottom = s_rect
+        if include_screen_edges and screen_rect:
+            s_left, s_top, s_right, s_bottom = screen_rect
             if s_bottom > s_top:
-                # Left screen edge
-                edges.append(ClimbableEdge(x=s_left, y_bottom=s_bottom, y_top=s_top, is_left_edge=True, is_screen_edge=True))
-                # Right screen edge
-                edges.append(ClimbableEdge(x=s_right, y_bottom=s_bottom, y_top=s_top, is_left_edge=False, is_screen_edge=True))
+                edges.append(ClimbableEdge(x=s_left, y_bottom=s_bottom, y_top=s_top,
+                                           is_left_edge=True, is_screen_edge=True))
+                edges.append(ClimbableEdge(x=s_right, y_bottom=s_bottom, y_top=s_top,
+                                           is_left_edge=False, is_screen_edge=True))
 
         return edges
 
-    # -----------------------------------------------------------------
-    # Pet Helper 3: Landing Ledge Detection
-    # -----------------------------------------------------------------
-    def find_landing_y(
-        self,
-        x: float,
-        y: float,
-        sprite_w: int,
-        sprite_h: int,
-        floor_y: float,
-        screen_rect: Any = None,
-    ) -> float:
-        """Find the highest ledge below the pet at x, so if the pet falls,
+    # ---- public read API ------------------------------------------------
 
-        it lands on top of a window or on the floor.
+    def get_snapshot(self) -> WindowSnapshot:
+        return self._ensure_snapshot()
 
-        Args:
-            x: Pet's current x coordinate (top-left)
-            y: Pet's current y coordinate (top-left)
-            sprite_w: Pet's sprite width
-            sprite_h: Pet's sprite height
-            floor_y: The pet's resting y position on the floor
-            screen_rect: Optional screen rectangle
+    def get_windows(self, force_refresh: bool = False) -> List[WindowInfo]:
+        return list(self._ensure_snapshot(force_refresh).windows)
 
-        Returns:
-            The pet's landing y coordinate (top-left) on the highest ledge below it,
-            or floor_y if no window ledge is below the pet.
+    def get_taskbar_rect(self, force_refresh: bool = False
+                         ) -> Optional[Tuple[int, int, int, int]]:
+        return self._ensure_snapshot(force_refresh).taskbar
+
+    def get_active_window(self) -> Optional[WindowInfo]:
+        """The focused window.
+
+        Served from the snapshot when a background poller is running, because
+        Xlib Display objects are not thread-safe and the poller owns ours. It
+        is at most one poll interval stale, which is fine for "what am I
+        looking at" dialogue and for a blocklist check.
         """
-        pet_left = x
-        pet_right = x + sprite_w
-        tolerance = 2.0  # Allow pet already resting on the ledge to register it
+        with self._lock:
+            if self._background:
+                return self._snapshot.active
+        try:
+            if IS_WIN:
+                return _win32_active_window()
+            if IS_LINUX:
+                return _linux_active_window()
+        except Exception:
+            pass
+        return None
 
-        ledges = self.get_walkable_ledges(screen_rect=screen_rect)
-        candidate_pet_ys: List[float] = []
+    def get_walkable_ledges(self, screen_rect: Any = None,
+                            force_refresh: bool = False) -> List[WalkableLedge]:
+        """Horizontal surfaces: window titlebars plus the taskbar/floor."""
+        snapshot = self._ensure_snapshot(force_refresh)
+        if screen_rect is None:
+            return list(snapshot.ledges)
+        normalized = _normalize_screen_rect(screen_rect)
+        if normalized == snapshot.screen_rect:
+            return list(snapshot.ledges)
+        return self._build_ledges(snapshot.windows, snapshot.taskbar, normalized)
 
-        for ledge in ledges:
-            # Floor ledges (screen bottom / taskbar) are handled by floor_y
+    def get_climbable_edges(self, screen_rect: Any = None,
+                            include_screen_edges: bool = True,
+                            force_refresh: bool = False) -> List[ClimbableEdge]:
+        """Vertical surfaces: window borders plus the screen edges."""
+        snapshot = self._ensure_snapshot(force_refresh)
+        if screen_rect is None:
+            edges = snapshot.edges
+        else:
+            normalized = _normalize_screen_rect(screen_rect)
+            if normalized == snapshot.screen_rect:
+                edges = snapshot.edges
+            else:
+                return self._build_edges(snapshot.windows, normalized, include_screen_edges)
+        if not include_screen_edges:
+            return [e for e in edges if not e.is_screen_edge]
+        return list(edges)
+
+    def find_landing_y(self, x: float, y: float, sprite_w: int, sprite_h: int,
+                      floor_y: float, screen_rect: Any = None,
+                      step: float = 0.0) -> float:
+        """Y of the highest surface under the pet, or floor_y.
+
+        Overlap (not centre containment) decides whether a ledge counts, so the
+        pet can land on the overhang of a narrow window.
+
+        `step` is how far the pet travels this frame. Without it, a pet that
+        has already moved past a thin titlebar in the same tick finds the ledge
+        "above" it, discards it, and tunnels straight through to the floor.
+        """
+        pet_left, pet_right = x, x + sprite_w
+        tolerance = 2.0 + max(0.0, float(step))
+
+        candidates: List[float] = []
+        for ledge in self.get_walkable_ledges(screen_rect=screen_rect):
             if ledge.is_floor:
                 continue
-
-            # Check horizontal overlap
-            overlap = min(pet_right, ledge.x_max) - max(pet_left, ledge.x_min)
-            # Must have positive overlap
-            if overlap <= 0:
+            if not ledge.holds_any(pet_left, pet_right):
                 continue
+            target_y = float(ledge.y - sprite_h)
+            if target_y >= y - tolerance and target_y < floor_y:
+                candidates.append(target_y)
 
-            # Target pet top-left y coordinate if it lands on this ledge
-            target_pet_y = float(ledge.y - sprite_h)
+        return min(candidates) if candidates else float(floor_y)
 
-            # Ledge must be below the pet (or at pet feet within tolerance)
-            # and above the floor
-            if target_pet_y >= y - tolerance and target_pet_y < floor_y:
-                candidate_pet_ys.append(target_pet_y)
+    def find_ledge_at(self, y: float, x: float, sprite_w: int,
+                      screen_rect: Any = None) -> Optional[WalkableLedge]:
+        """The ledge directly under the pet, matched on overlap like
+        `find_landing_y` so the two can never disagree."""
+        bottom = y
+        center = x + sprite_w / 2.0
+        best: Optional[WalkableLedge] = None
+        for ledge in self.get_walkable_ledges(screen_rect=screen_rect):
+            if ledge.is_floor:
+                continue
+            if abs(ledge.y - bottom) > 8:
+                continue
+            if ledge.holds_center(center) or ledge.holds_any(x, x + sprite_w):
+                if best is None or ledge.y < best.y:
+                    best = ledge
+        return best
 
-        if candidate_pet_ys:
-            # Highest physical ledge = smallest y coordinate
-            return min(candidate_pet_ys)
+    def find_nearby_climbable(self, pet_x: float, pet_y: float, sprite_w: int,
+                              sprite_h: int, reach_px: float = 30.0,
+                              screen_rect: Any = None) -> Optional[ClimbableEdge]:
+        """The closest climbable edge within reach of the pet."""
+        pet_left, pet_right = pet_x, pet_x + sprite_w
+        pet_top, pet_bottom = pet_y, pet_y + sprite_h
+        center_x = (pet_left + pet_right) / 2.0
 
-        return float(floor_y)
+        best: Optional[ClimbableEdge] = None
+        best_key: Optional[Tuple[float, int, int]] = None
 
-    # -----------------------------------------------------------------
-    # Pet Helper 4: Nearby Climbable Edge Detection
-    # -----------------------------------------------------------------
-    def find_nearby_climbable(
-        self,
-        pet_x: float,
-        pet_y: float,
-        sprite_w: int,
-        sprite_h: int,
-        reach_px: float = 30.0,
-        screen_rect: Any = None,
-    ) -> Optional[ClimbableEdge]:
-        """Find if there is a window edge or screen edge nearby that the cat can grab and climb.
-
-        Args:
-            pet_x: Pet's current x position (top-left)
-            pet_y: Pet's current y position (top-left)
-            sprite_w: Pet sprite width
-            sprite_h: Pet sprite height
-            reach_px: Grabbing reach radius in pixels
-            screen_rect: Optional screen bounding rectangle
-
-        Returns:
-            ClimbableEdge if a nearby edge is found within reach_px, else None.
-        """
-        pet_left = pet_x
-        pet_right = pet_x + sprite_w
-        pet_top = pet_y
-        pet_bottom = pet_y + sprite_h
-
-        edges = self.get_climbable_edges(screen_rect=screen_rect, include_screen_edges=True)
-
-        best_edge: Optional[ClimbableEdge] = None
-        min_dist = float("inf")
-
-        for edge in edges:
+        for edge in self.get_climbable_edges(screen_rect=screen_rect):
             y_min = min(edge.y_top, edge.y_bottom)
             y_max = max(edge.y_top, edge.y_bottom)
-
-            # 1. Vertical range check (pet must overlap vertically with reach margin)
             if pet_bottom < y_min - reach_px or pet_top > y_max + reach_px:
                 continue
 
-            # 2. Horizontal distance check
             if edge.x < pet_left:
-                dist_x = pet_left - edge.x
+                dist = pet_left - edge.x
             elif edge.x > pet_right:
-                dist_x = edge.x - pet_right
+                dist = edge.x - pet_right
             else:
-                dist_x = 0.0
+                dist = 0.0
+            if dist > reach_px:
+                continue
 
-            if dist_x <= reach_px:
-                if dist_x < min_dist:
-                    min_dist = dist_x
-                    best_edge = ClimbableEdge(
-                        x=edge.x,
-                        y_bottom=edge.y_bottom,
-                        y_top=edge.y_top,
-                        is_left_edge=edge.is_left_edge,
-                        distance=dist_x,
-                        is_screen_edge=edge.is_screen_edge,
-                    )
+            # Deterministic tie-break: distance, then nearest-to-centre, then
+            # left edge first. Previously ties went to whichever window the OS
+            # happened to enumerate first, so the pet picked a different
+            # window frame to climb on every launch.
+            key = (dist, abs(edge.x - center_x), 0 if edge.is_left_edge else 1)
+            if best_key is None or key < best_key:
+                best_key = key
+                best = ClimbableEdge(
+                    x=edge.x, y_bottom=edge.y_bottom, y_top=edge.y_top,
+                    is_left_edge=edge.is_left_edge, distance=dist,
+                    is_screen_edge=edge.is_screen_edge,
+                )
 
-        return best_edge
+        return best
+
+    def edge_still_present(self, edge: ClimbableEdge,
+                           tolerance: int = 12) -> bool:
+        """Whether the thing being climbed is still on screen.
+
+        A window can close mid-climb; without this the cat scrambles up thin
+        air for the rest of the timeout.
+        """
+        if edge is None:
+            return False
+        for candidate in self.get_climbable_edges():
+            if abs(candidate.x - edge.x) > tolerance:
+                continue
+            if abs(candidate.y_top - edge.y_top) > tolerance:
+                continue
+            if abs(candidate.y_bottom - edge.y_bottom) > tolerance:
+                continue
+            if candidate.is_left_edge == edge.is_left_edge:
+                return True
+        return False
 
 
 # =====================================================================
-# Module-level Convenience Functions (Singleton Pattern)
+# Module-level convenience API
 # =====================================================================
 
 _default_tracker: Optional[WindowTracker] = None
+_default_lock = threading.Lock()
 
 
 def get_tracker() -> WindowTracker:
-    """Return the global default WindowTracker singleton."""
+    """The global tracker singleton."""
     global _default_tracker
-    if _default_tracker is None:
-        _default_tracker = WindowTracker()
-    return _default_tracker
+    with _default_lock:
+        if _default_tracker is None:
+            _default_tracker = WindowTracker()
+        return _default_tracker
 
 
 def list_windows(force_refresh: bool = False) -> List[WindowInfo]:
-    """Return list of active, unminimized, visible windows."""
     return get_tracker().get_windows(force_refresh=force_refresh)
 
 
+def get_active_window() -> Optional[WindowInfo]:
+    return get_tracker().get_active_window()
+
+
 def get_taskbar_rect(force_refresh: bool = False) -> Optional[Tuple[int, int, int, int]]:
-    """Return taskbar/dock bounding rect if detected."""
     return get_tracker().get_taskbar_rect(force_refresh=force_refresh)
 
 
 def get_walkable_ledges(screen_rect: Any = None, force_refresh: bool = False) -> List[WalkableLedge]:
-    """Return walkable horizontal segments (y, x_min, x_max)."""
     return get_tracker().get_walkable_ledges(screen_rect=screen_rect, force_refresh=force_refresh)
 
 
-def get_climbable_edges(
-    screen_rect: Any = None, include_screen_edges: bool = True, force_refresh: bool = False
-) -> List[ClimbableEdge]:
-    """Return vertical climbable segments (x, y_bottom, y_top, is_left_edge)."""
+def get_climbable_edges(screen_rect: Any = None, include_screen_edges: bool = True,
+                        force_refresh: bool = False) -> List[ClimbableEdge]:
     return get_tracker().get_climbable_edges(
-        screen_rect=screen_rect, include_screen_edges=include_screen_edges, force_refresh=force_refresh
-    )
+        screen_rect=screen_rect, include_screen_edges=include_screen_edges,
+        force_refresh=force_refresh)
 
 
-def find_landing_y(
-    x: float, y: float, sprite_w: int, sprite_h: int, floor_y: float, screen_rect: Any = None
-) -> float:
-    """Find the highest ledge below the pet at x, or floor_y."""
-    return get_tracker().find_landing_y(
-        x=x, y=y, sprite_w=sprite_w, sprite_h=sprite_h, floor_y=floor_y, screen_rect=screen_rect
-    )
+def find_landing_y(x: float, y: float, sprite_w: int, sprite_h: int,
+                   floor_y: float, screen_rect: Any = None,
+                   step: float = 0.0) -> float:
+    return get_tracker().find_landing_y(x=x, y=y, sprite_w=sprite_w, sprite_h=sprite_h,
+                                        floor_y=floor_y, screen_rect=screen_rect,
+                                        step=step)
 
 
-def find_nearby_climbable(
-    pet_x: float, pet_y: float, sprite_w: int, sprite_h: int, reach_px: float = 30.0, screen_rect: Any = None
-) -> Optional[ClimbableEdge]:
-    """Find if a window or screen edge is nearby within reach_px."""
+def find_ledge_at(y: float, x: float, sprite_w: int, screen_rect: Any = None
+                  ) -> Optional[WalkableLedge]:
+    return get_tracker().find_ledge_at(y=y, x=x, sprite_w=sprite_w, screen_rect=screen_rect)
+
+
+def find_nearby_climbable(pet_x: float, pet_y: float, sprite_w: int, sprite_h: int,
+                          reach_px: float = 30.0, screen_rect: Any = None
+                          ) -> Optional[ClimbableEdge]:
     return get_tracker().find_nearby_climbable(
-        pet_x=pet_x, pet_y=pet_y, sprite_w=sprite_w, sprite_h=sprite_h, reach_px=reach_px, screen_rect=screen_rect
-    )
+        pet_x=pet_x, pet_y=pet_y, sprite_w=sprite_w, sprite_h=sprite_h,
+        reach_px=reach_px, screen_rect=screen_rect)
+
+
+def detection_is_complete() -> bool:
+    """Public: can we see every window? False under Wayland, by design."""
+    return _detection_is_complete()

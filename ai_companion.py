@@ -1,3 +1,20 @@
+"""AI companion bridge: Groq calls, config, memory, and rate limiting.
+
+Everything in this module is safe to call from a worker thread. The pet's Qt
+callbacks arrive on the GUI thread via a queued signal, so this module never
+touches Qt.
+
+The result of a request is reported to the caller as ``(text, status)``:
+
+    "ok"           - `text` is a real model reply, safe to speak as-is
+    "skipped"      - rate limit / daily cap / circuit breaker: say nothing
+    "unavailable"  - AI is off, misconfigured, or the call failed: the caller
+                     may fall back to a canned line
+
+That distinction matters: the old code reported every failure as "no text",
+so a dead API made the pet emit a random unsolicited line on every attempt.
+"""
+
 import os
 import re
 import json
@@ -9,23 +26,55 @@ CONFIG_PATH = os.path.join(BASE_DIR, "companion_config.json")
 MEMORY_PATH = os.path.join(BASE_DIR, "companion_memory.json")
 ENV_PATH = os.path.join(BASE_DIR, ".env")
 
-CIRCUIT_COOLDOWN = 30 * 60
+# How long to stop trying after every key has failed (dead network, bad model).
+CIRCUIT_COOLDOWN = 10 * 60
+# How long a single key stays sidelined after a 429, before it is retried.
+KEY_COOLDOWN = 5 * 60
+# Network/SDK timeout, seconds. Without this a hung socket pins a thread.
+REQUEST_TIMEOUT = 20.0
+# Reasoning models can burn the whole budget thinking. If that happens we
+# double the budget next time rather than talking to ourselves.
+MIN_TOKEN_BUDGET = 40
+MAX_TOKEN_BUDGET = 1024
+
+STATUS_OK = "ok"
+STATUS_SKIPPED = "skipped"
+STATUS_UNAVAILABLE = "unavailable"
+
+# Errors that mean "this will never work until the config changes" and so
+# should not be retried on every call.
+_FATAL_ERRORS = ("NotFoundError", "model_not_found", "invalid_request_error")
 
 
-# ---- .env ----
+# =====================================================================
+# .env
+# =====================================================================
+
 def _load_env(path):
+    """Load KEY=VALUE pairs from a .env file into os.environ.
+
+    Never overrides a variable that is already set in the real environment.
+    Tolerates `export ` prefixes, `#` comments, and blank lines.
+    """
     if not os.path.exists(path):
         return
-    with open(path, "r", encoding="utf-8") as f:
-        for raw in f:
-            line = raw.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            k, v = line.split("=", 1)
-            k = k.strip()
-            v = v.strip().strip('"').strip("'")
-            if k and k not in os.environ:
-                os.environ[k] = v
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("export "):
+                    line = line[len("export "):].strip()
+                if "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k = k.strip()
+                v = v.split(" #", 1)[0].strip().strip('"').strip("'")
+                if k and k not in os.environ:
+                    os.environ[k] = v
+    except Exception:
+        pass
 
 
 _load_env(ENV_PATH)
@@ -35,13 +84,38 @@ try:
     from groq import Groq
     _HAS_GROQ = True
 except Exception:
+    groq = None
     _HAS_GROQ = False
 
-MODEL = os.environ.get("MODEL", "qwen/qwen3.6-27b")
-_KEYS = [v for k, v in sorted(os.environ.items())
-         if re.fullmatch(r"GROQ_API_KEY\d*", k) and v]
-_clients = [Groq(api_key=k) for k in _KEYS] if _HAS_GROQ else []
+MODEL = os.environ.get("MODEL", "qwen/qwen3.8-27b")
 
+
+def _collect_api_keys():
+    """All GROQ_API_KEY* values, with GROQ_API_KEY2 before GROQ_API_KEY10."""
+    found = []
+    for name, value in os.environ.items():
+        if not value:
+            continue
+        m = re.fullmatch(r"GROQ_API_KEY(\d*)", name)
+        if m:
+            found.append((int(m.group(1)) if m.group(1) else 1, value))
+    found.sort(key=lambda item: item[0])
+    return [value for _idx, value in found]
+
+
+_KEYS = _collect_api_keys()
+_clients = []
+if _HAS_GROQ and _KEYS:
+    for _key in _KEYS:
+        try:
+            _clients.append(Groq(api_key=_key, timeout=REQUEST_TIMEOUT, max_retries=0))
+        except Exception:
+            pass
+
+
+# =====================================================================
+# Config
+# =====================================================================
 
 def _default_config():
     return {
@@ -68,17 +142,23 @@ def _default_config():
     }
 
 
+def _deep_merge(base, override):
+    """Merge nested dicts so a user config can override one leaf without
+    having to restate its siblings (e.g. only `screenshots.enabled`)."""
+    for key, value in (override or {}).items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            _deep_merge(base[key], value)
+        else:
+            base[key] = value
+    return base
+
+
 def _load_config():
     cfg = _default_config()
     if os.path.exists(CONFIG_PATH):
         try:
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                user_cfg = json.load(f)
-            for k, v in user_cfg.items():
-                if isinstance(v, dict) and isinstance(cfg.get(k), dict):
-                    cfg[k].update(v)
-                else:
-                    cfg[k] = v
+                _deep_merge(cfg, json.load(f))
         except Exception:
             pass
     return cfg
@@ -86,67 +166,204 @@ def _load_config():
 
 CONFIG = _load_config()
 
-_state = {"key_idx": 0, "dead_keys": set(), "disabled_until": 0}
+
+# =====================================================================
+# Mutable state (all access under _lock)
+# =====================================================================
+
+_lock = threading.RLock()
+_state = {
+    "key_idx": 0,
+    "dead_keys": set(),        # auth failures: never retried this session
+    "key_cooldown": {},        # 429s: retried after KEY_COOLDOWN
+    "disabled_until": 0.0,
+    "fatal_reason": "",        # e.g. "model_not_found"; cleared on config fix
+    "token_budget": MIN_TOKEN_BUDGET,
+}
 _sent_log = {"idle": [], "screenshot": []}
 _daily = {"date": "", "count": 0}
-_lock = threading.Lock()
+_last_capture = 0.0
+_warned = set()
 
+
+def _warn_once(key, message):
+    """Print a diagnostic at most once per process, so a misconfigured model
+    is visible instead of failing silently forever."""
+    with _lock:
+        if key in _warned:
+            return
+        _warned.add(key)
+    print("[ai_companion] %s" % message, flush=True)
+
+
+# =====================================================================
+# Public status
+# =====================================================================
 
 def ai_enabled():
+    with _lock:
+        if _state["fatal_reason"]:
+            return False
     return bool(CONFIG.get("ai_enabled", True) and _HAS_GROQ and _clients)
+
+
+def ai_configured() -> bool:
+    """Whether the model is set up, regardless of whether it is working.
+
+    Lets the UI distinguish "you never configured this" from "this is
+    configured and failing", which is the difference between a hint and a
+    retry button.
+    """
+    return bool(_HAS_GROQ and _clients and os.environ.get("MODEL"))
+
+
+def reset_failures() -> None:
+    """Clear the circuit breaker and key bans so the next call tries again.
+
+    For the "Retry AI" menu item after fixing MODEL or adding a key.
+    """
+    with _lock:
+        _state["fatal_reason"] = ""
+        _state["dead_keys"].clear()
+        _state["key_cooldown"].clear()
+        _state["disabled_until"] = 0.0
+        _state["key_idx"] = 0
+
+
+def ai_status():
+    """Human-readable reason the AI is on or off, for menus and diagnostics."""
+    with _lock:
+        fatal = _state["fatal_reason"]
+    if not CONFIG.get("ai_enabled", True):
+        return {"enabled": False, "reason": "disabled in companion_config.json"}
+    if not _HAS_GROQ:
+        return {"enabled": False, "reason": "the groq package is not installed"}
+    if not _clients:
+        return {"enabled": False, "reason": "no GROQ_API_KEY set in .env"}
+    if fatal:
+        return {"enabled": False, "reason": fatal}
+    return {"enabled": True, "reason": "%s via %d key(s)" % (MODEL, len(_clients))}
+
+
+def screenshot_settings():
+    return CONFIG.get("screenshots", {})
+
+
+# =====================================================================
+# Memory
+# =====================================================================
+
+def _memory_enabled():
+    return bool(CONFIG.get("memory", {}).get("enabled", True))
+
+
+def _load_memory():
+    if not _memory_enabled():
+        return []
+    try:
+        with open(MEMORY_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return [str(item) for item in data] if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _remember(fact):
+    fact = (fact or "").strip()
+    if not fact or not _memory_enabled():
+        return
+    with _lock:
+        mem = _load_memory()
+        if fact in mem:
+            return
+        mem.append(fact)
+        cap = int(CONFIG.get("memory", {}).get("max_facts", 20))
+        mem = mem[-cap:] if cap > 0 else []
+        # Write atomically: a crash mid-dump used to truncate the file, and a
+        # truncated file silently loaded as "no memories".
+        tmp = MEMORY_PATH + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(mem, f, indent=2)
+            os.replace(tmp, MEMORY_PATH)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 
 def _system_prompt(skin):
     per = CONFIG.get("companions", {}).get(skin, {})
+    if not isinstance(per, dict):
+        per = {}
     prompt = per.get("system_prompt") or CONFIG.get("default_system_prompt", "")
+    if _memory_enabled():
+        # Restated on every call so a per-companion prompt can never break the
+        # memory contract: the marker is parsed off the reply before it is
+        # spoken, and it has to be its own final line to survive intact.
+        prompt += ("\nIf you learn something worth remembering, put it on its own "
+                   "final line as 'MEMORY: <short fact about the user>' and nothing "
+                   "after it. Never say the word memory otherwise.")
     mem = _load_memory()
     if mem:
         prompt += "\nThings you remember about the user: " + "; ".join(mem[-8:])
     return prompt
 
 
-def _load_memory():
-    if not CONFIG.get("memory", {}).get("enabled", True):
-        return []
-    try:
-        with open(MEMORY_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return []
+# =====================================================================
+# MEMORY: line extraction (pure, so it is directly testable)
+# =====================================================================
+
+_MEMORY_RE = re.compile(r"(?:\A|\n|\s)MEMORY\s*:\s*", re.IGNORECASE)
 
 
-def _remember(fact):
-    if not CONFIG.get("memory", {}).get("enabled", True):
-        return
-    fact = fact.strip()
-    if not fact:
-        return
-    cap = CONFIG.get("memory", {}).get("max_facts", 20)
-    mem = _load_memory()
-    mem.append(fact)
-    mem = mem[-cap:]
-    try:
-        with open(MEMORY_PATH, "w", encoding="utf-8") as f:
-            json.dump(mem, f)
-    except Exception:
-        pass
+def split_memory_line(text):
+    """Split a raw model reply into (text_to_say, [facts]).
+
+    The prompt asks for a final line starting with ``MEMORY: ``, but models
+    routinely append it mid-sentence ("sure! MEMORY: likes dark roast") or
+    inline after other prose. Everything after the marker on that line is
+    treated as the fact and never spoken, and the marker is always removed
+    from what the user sees.
+    """
+    if not text:
+        return None, []
+
+    facts = []
+    kept = []
+    for line in text.strip().splitlines():
+        match = _MEMORY_RE.search(line)
+        if match:
+            fact = line[match.end():].strip()
+            if fact:
+                facts.append(fact)
+            # Drop the marker *and* the fact from what gets spoken.
+            line = line[:match.start()]
+        kept.append(line)
+
+    spoken = " ".join(" ".join(kept).split()).strip()
+    return (spoken or None), facts
 
 
 def _extract_memory(text):
-    if not text:
-        return text
-    kept = []
-    for line in text.strip().splitlines():
-        if line.strip().upper().startswith("MEMORY:"):
-            _remember(line.split(":", 1)[1])
-        else:
-            kept.append(line)
-    out = " ".join(" ".join(kept).split())
-    return out or None
+    """Strip MEMORY: facts out of a reply, persist them, return what to say."""
+    spoken, facts = split_memory_line(text)
+    for fact in facts:
+        _remember(fact)
+    return spoken
 
 
-# ---- rate limiting ----
-def _rate_ok(kind):
+# =====================================================================
+# Rate limiting
+# =====================================================================
+
+def _reserve(kind):
+    """Atomically check the limits and claim a slot.
+
+    Check and claim must be one critical section: doing them separately let
+    two threads both pass the check and both send.
+    """
     cfg = CONFIG.get("rate_limits", {})
     min_gap = cfg.get("min_seconds_between", {}).get(kind, 60)
     cap = cfg.get("max_per_hour", {}).get(kind, 6)
@@ -158,12 +375,16 @@ def _rate_ok(kind):
             return False
         if len(log) >= cap:
             return False
+        log.append(now)
         return True
 
 
-def _mark_sent(kind):
+def _release(kind):
+    """Give a claimed slot back when the request produced nothing."""
     with _lock:
-        _sent_log[kind].append(time.time())
+        log = _sent_log[kind]
+        if log:
+            log.pop()
 
 
 def screenshot_daily_ok():
@@ -178,71 +399,222 @@ def screenshot_daily_ok():
 
 def _screenshot_daily_mark():
     with _lock:
+        if _daily["date"] != time.strftime("%Y-%m-%d"):
+            _daily["date"] = time.strftime("%Y-%m-%d")
+            _daily["count"] = 0
         _daily["count"] += 1
 
 
-# ---- Groq call w/ key rotation + circuit breaker ----
-def _call(messages, max_tokens=50):
+def screenshot_slot_ok():
+    """The whole screenshot policy in one place.
+
+    Returns True only when a capture is both allowed and worth paying for.
+    The caller should do nothing at all when this is False -- the old code
+    kept re-checking the policy on a timer and then grabbed the screen before
+    finding out the request would be rejected.
+    """
+    scfg = CONFIG.get("screenshots", {})
+    if not scfg.get("enabled", False):
+        return False
+    if not ai_enabled():
+        return False
+    with _lock:
+        interval = float(scfg.get("interval_minutes", 15)) * 60.0
+        if _last_capture and (time.time() - _last_capture) < interval:
+            return False
+    if not screenshot_daily_ok():
+        return False
+    return _reserve("screenshot")
+
+
+def record_capture_attempt(captured):
+    """Close out a screenshot slot after the capture was attempted.
+
+    The interval throttle is set either way so a blocked window does not turn
+    into a capture every tick, but the hourly/daily quota is only charged when
+    a frame really was taken and sent.
+    """
+    global _last_capture
+    with _lock:
+        _last_capture = time.time()
+        if captured:
+            _screenshot_daily_mark()
+        else:
+            _release("screenshot")
+
+
+# =====================================================================
+# Groq call with key rotation + circuit breaker
+# =====================================================================
+
+def _classify_error(exc):
+    """('fatal'|'cooldown'|'transient', short reason)"""
+    name = type(exc).__name__
+    text = str(exc)
+    if any(marker in text for marker in _FATAL_ERRORS):
+        if "model" in text.lower():
+            return "fatal", "model_not_found: %s is not available for this key" % MODEL
+        return "fatal", "invalid_request: %s" % text[:120]
+    if name == "AuthenticationError":
+        return "dead", "auth_failed"
+    if name in ("RateLimitError", "APIConnectionError", "APITimeoutError"):
+        return "cooldown", name
+    return "transient", name
+
+
+def _extract_content(resp):
+    """Pull the spoken text out of a completion.
+
+    Reasoning models (the Qwen3 family) can spend the entire token budget
+    thinking and return an empty content string, which used to look exactly
+    like "the API is down". Returns "" when there is nothing to say.
+    """
+    try:
+        choice = resp.choices[0]
+    except (AttributeError, IndexError, KeyError):
+        return ""
+
+    message = getattr(choice, "message", None)
+    if message is None and isinstance(choice, dict):
+        message = choice.get("message")
+    if message is None:
+        return ""
+
+    if isinstance(message, dict):
+        content = message.get("content")
+        reasoning = message.get("reasoning")
+        finish = choice.get("finish_reason") if isinstance(choice, dict) else getattr(choice, "finish_reason", None)
+    else:
+        content = getattr(message, "content", None)
+        reasoning = getattr(message, "reasoning", None)
+        finish = getattr(choice, "finish_reason", None)
+
+    text = (content or "").strip()
+    if text:
+        return text
+
+    # Out of budget mid-thought: grow the budget for next time instead of
+    # silently degrading to canned lines forever.
+    if reasoning and finish == "length":
+        with _lock:
+            if _state["token_budget"] < MAX_TOKEN_BUDGET:
+                _state["token_budget"] = min(MAX_TOKEN_BUDGET, _state["token_budget"] * 2)
+    return ""
+
+
+def _call(messages, max_tokens=MIN_TOKEN_BUDGET):
+    """Send one chat completion, rotating keys until one works.
+
+    Returns the reply text, or None if every key failed.
+    """
     if not ai_enabled():
         return None
+
     with _lock:
         if time.time() < _state["disabled_until"]:
             return None
+        now = time.time()
+        for idx in list(_state["key_cooldown"]):
+            if now - _state["key_cooldown"][idx] > KEY_COOLDOWN:
+                del _state["key_cooldown"][idx]
+        start_idx = _state["key_idx"]
+        budget = max(max_tokens, _state["token_budget"])
+
+    reason = ""
+    fatal = False
     n = len(_clients)
     for offset in range(n):
-        idx = (_state["key_idx"] + offset) % n
-        if idx in _state["dead_keys"]:
-            continue
+        idx = (start_idx + offset) % n
+        with _lock:
+            if idx in _state["dead_keys"] or idx in _state["key_cooldown"]:
+                continue
         try:
             resp = _clients[idx].chat.completions.create(
                 model=MODEL,
                 messages=messages,
                 temperature=0.9,
-                max_completion_tokens=max_tokens,
+                max_completion_tokens=budget,
                 top_p=1,
                 stream=False,
             )
             with _lock:
-                _state["key_idx"] = idx
-                _state["disabled_until"] = 0
-            return resp.choices[0].message.content
-        except groq.AuthenticationError:
-            _state["dead_keys"].add(idx)
-            continue
-        except groq.RateLimitError:
-            continue
-        except Exception:
-            continue
-    with _lock:
-        _state["disabled_until"] = time.time() + CIRCUIT_COOLDOWN
+                # Rotate on success too, so multiple keys share the load
+                # instead of the first key taking every request forever.
+                _state["key_idx"] = (idx + 1) % n
+                _state["disabled_until"] = 0.0
+            return _extract_content(resp)
+        except Exception as exc:
+            kind, why = _classify_error(exc)
+            reason = why
+            if kind == "fatal":
+                fatal = True
+                break
+            with _lock:
+                if kind == "dead":
+                    _state["dead_keys"].add(idx)
+                elif kind == "cooldown":
+                    _state["key_cooldown"][idx] = time.time()
+
+    if fatal:
+        with _lock:
+            _state["fatal_reason"] = reason
+        _warn_once("fatal", "%s (set MODEL in .env to a model your key can use)" % reason)
+    else:
+        with _lock:
+            all_dead = all(i in _state["dead_keys"] for i in range(n))
+            _state["disabled_until"] = 0.0 if all_dead else time.time() + CIRCUIT_COOLDOWN
+        _warn_once("call_failed", "every call failed (%s); retrying in %d min"
+                   % (reason or "unknown", CIRCUIT_COOLDOWN // 60))
     return None
 
 
+# =====================================================================
+# Public request API
+# =====================================================================
+
+def _run_worker(work):
+    def guarded():
+        try:
+            work()
+        except Exception as exc:  # never let a worker die noisily
+            _warn_once("worker", "background request crashed: %r" % (exc,))
+    threading.Thread(target=guarded, daemon=True).start()
+
+
 def maybe_idle_line(skin, on_done):
-    if not ai_enabled() or not _rate_ok("idle"):
-        on_done(None)
+    """Ask for a spontaneous line. on_done(text, status)."""
+    if not ai_enabled():
+        on_done(None, STATUS_UNAVAILABLE)
+        return
+    if not _reserve("idle"):
+        on_done(None, STATUS_SKIPPED)
         return
 
     def work():
         messages = [
             {"role": "system", "content": _system_prompt(skin)},
-            {"role": "user", "content": "Say one short in-character line to the user right now."},
+            {"role": "user", "content":
+             "Say one short in-character line to the user right now."},
         ]
-        text = _extract_memory(_call(messages, max_tokens=40))
-        if text:
-            _mark_sent("idle")
-        on_done(text)
+        raw = _call(messages, max_tokens=MIN_TOKEN_BUDGET)
+        if not raw:
+            _release("idle")
+            on_done(None, STATUS_UNAVAILABLE)
+            return
+        on_done(_extract_memory(raw), STATUS_OK)
 
-    threading.Thread(target=work, daemon=True).start()
+    _run_worker(work)
 
 
 def request_screenshot_comment(skin, image_b64, on_done):
+    """Ask for a reaction to an already-captured screenshot.
+
+    The caller must have won a slot via screenshot_slot_ok() and must call
+    _mark_capture() once the capture actually happened.
+    """
     scfg = CONFIG.get("screenshots", {})
     if not ai_enabled() or not scfg.get("enabled", False):
-        on_done(None)
-        return
-    if not _rate_ok("screenshot") or not screenshot_daily_ok():
-        on_done(None)
+        on_done(None, STATUS_UNAVAILABLE)
         return
 
     def work():
@@ -254,18 +626,17 @@ def request_screenshot_comment(skin, image_b64, on_done):
         messages = [
             {"role": "system", "content": sys_prompt},
             {"role": "user", "content": [
-                {"type": "text", "text": "What's the user up to? One short in-character reaction."},
-                {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + image_b64}},
+                {"type": "text", "text":
+                 "What's the user up to? One short in-character reaction."},
+                {"type": "image_url", "image_url": {
+                    "url": "data:image/jpeg;base64," + image_b64}},
             ]},
         ]
-        text = _extract_memory(_call(messages, max_tokens=60))
-        if text:
-            _mark_sent("screenshot")
-            _screenshot_daily_mark()
-        on_done(text)
+        raw = _call(messages, max_tokens=80)
+        if not raw:
+            _release("screenshot")
+            on_done(None, STATUS_UNAVAILABLE)
+            return
+        on_done(_extract_memory(raw), STATUS_OK)
 
-    threading.Thread(target=work, daemon=True).start()
-
-
-def screenshot_settings():
-    return CONFIG.get("screenshots", {})
+    _run_worker(work)

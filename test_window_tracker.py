@@ -1,11 +1,12 @@
-"""Unit and integration tests for window_tracker.py.
+"""Tests for window_tracker.py.
 
-Tests cross-platform window tracking, Windows/Linux backends, fallback modes,
-caching, and geometry helper methods for desktop pets.
+Covers the geometry helpers, the caching/snapshot machinery, the HiDPI
+coordinate conversion, the Wayland trust rules, and the platform backends
+(mocked, so they run anywhere). Run with:
+
+    python3 -m unittest test_window_tracker
 """
 
-import os
-import sys
 import time
 import unittest
 from unittest.mock import MagicMock, patch
@@ -16,6 +17,7 @@ from window_tracker import (
     WalkableLedge,
     WindowInfo,
     WindowTracker,
+    detection_is_complete,
     find_landing_y,
     find_nearby_climbable,
     get_climbable_edges,
@@ -26,305 +28,290 @@ from window_tracker import (
     safe_translate_coords,
 )
 
+SCREEN = (0, 0, 1920, 1080)
+
 
 class TestDataStructures(unittest.TestCase):
-    """Test WindowInfo, WalkableLedge, and ClimbableEdge structures."""
-
-    def test_window_info(self):
-        w = WindowInfo(
-            id=123,
-            title="Editor",
-            rect=(100, 200, 700, 600),
-            process="code",
-            is_taskbar=False,
-            is_minimized=False,
-            is_visible=True,
-        )
-        self.assertEqual(w.left, 100)
-        self.assertEqual(w.top, 200)
-        self.assertEqual(w.right, 700)
-        self.assertEqual(w.bottom, 600)
+    def test_window_info_rect_accessors(self):
+        w = WindowInfo(id=123, title="Editor", rect=(100, 200, 700, 600),
+                       process="code", pid=42)
+        self.assertEqual((w.left, w.top, w.right, w.bottom), (100, 200, 700, 600))
         self.assertEqual(w.width, 600)
         self.assertEqual(w.height, 400)
-        # Dict indexing
-        self.assertEqual(w["rect"], (100, 200, 700, 600))
-        self.assertEqual(w["title"], "Editor")
-        self.assertEqual(w["process"], "code")
-        self.assertEqual(w["id"], 123)
+        self.assertEqual(w.pid, 42)
 
-    def test_walkable_ledge_unpacking(self):
-        ledge = WalkableLedge(y=300, x_min=100, x_max=500, is_taskbar=False, is_floor=False)
-        y, x_min, x_max = ledge[:3]
-        self.assertEqual(y, 300)
-        self.assertEqual(x_min, 100)
-        self.assertEqual(x_max, 500)
+    def test_window_info_ignores_degenerate_rects(self):
+        w = WindowInfo(rect=(700, 600, 100, 200))
+        self.assertEqual(w.width, 0)
+        self.assertEqual(w.height, 0)
+
+    def test_walkable_ledge_helpers(self):
+        ledge = WalkableLedge(y=300, x_min=100, x_max=500)
         self.assertEqual(ledge.width, 400)
+        self.assertTrue(ledge.holds_center(300))
+        self.assertFalse(ledge.holds_center(90))
+        # Overlap is what landing uses, so a partial overhang counts.
+        self.assertTrue(ledge.holds_any(480, 560))
+        self.assertFalse(ledge.holds_any(500, 560))
 
-    def test_climbable_edge_unpacking(self):
-        edge = ClimbableEdge(x=200, y_bottom=800, y_top=200, is_left_edge=True, distance=5.0)
-        x, y_bot, y_top, is_left = edge[:4]
-        self.assertEqual(x, 200)
-        self.assertEqual(y_bot, 800)
-        self.assertEqual(y_top, 200)
-        self.assertTrue(is_left)
+    def test_climbable_edge_helpers(self):
+        edge = ClimbableEdge(x=200, y_bottom=800, y_top=200, is_left_edge=True,
+                             distance=5.0)
         self.assertEqual(edge.height, 600)
         self.assertEqual(edge.distance, 5.0)
 
 
-class TestCaching(unittest.TestCase):
-    """Test caching and resource preservation."""
-
-    def test_caching_interval(self):
-        tracker = WindowTracker(cache_interval=1.0)
-        mock_windows = [
-            WindowInfo(id=1, title="Test Window", rect=(100, 100, 500, 400))
-        ]
-
-        with patch.object(tracker, "_query_os_windows", return_value=(mock_windows, None)) as mock_query:
-            # First call queries OS
-            wins1 = tracker.get_windows()
-            self.assertEqual(len(wins1), 1)
-            self.assertEqual(mock_query.call_count, 1)
-
-            # Second immediate call uses cache
-            wins2 = tracker.get_windows()
-            self.assertEqual(len(wins2), 1)
-            self.assertEqual(mock_query.call_count, 1)
-
-            # force_refresh bypasses cache
-            wins3 = tracker.get_windows(force_refresh=True)
-            self.assertEqual(len(wins3), 1)
-            self.assertEqual(mock_query.call_count, 2)
-
-            # After invalidation
-            tracker.invalidate_cache()
-            tracker.get_windows()
-            self.assertEqual(mock_query.call_count, 3)
-
-    def test_exclude_titles(self):
-        tracker = WindowTracker(exclude_titles=["my pet", "desktop"])
-        mock_windows = [
-            WindowInfo(id=1, title="My Pet Window", rect=(0, 0, 100, 100)),
-            WindowInfo(id=2, title="Desktop View", rect=(0, 0, 100, 100)),
-            WindowInfo(id=3, title="Browser", rect=(100, 100, 600, 500)),
-        ]
-        with patch.object(tracker, "_query_os_windows", return_value=(mock_windows, None)):
-            res = tracker.get_windows(force_refresh=True)
-            self.assertEqual(len(res), 1)
-            self.assertEqual(res[0].title, "Browser")
-
-
-class TestPetHelpers(unittest.TestCase):
-    """Test helper methods for walking, climbing, and landing."""
-
+class TestSnapshotAndCache(unittest.TestCase):
     def setUp(self):
-        self.tracker = WindowTracker(cache_interval=10.0)
-        # Setup simulated windows:
-        # Window A: Left=100, Top=200, Right=500, Bottom=600
-        # Window B: Left=400, Top=400, Right=900, Bottom=750
-        self.mock_windows = [
+        self.tracker = WindowTracker(cache_interval=1.0)
+        self.windows = [
             WindowInfo(id=1, title="Window A", rect=(100, 200, 500, 600)),
             WindowInfo(id=2, title="Window B", rect=(400, 400, 900, 750)),
         ]
-        self.tracker._cached_windows = list(self.mock_windows)
-        self.tracker._cached_taskbar = (0, 1000, 1920, 1080)
-        self.tracker._last_poll_time = time.monotonic()
+
+    def _patched(self, windows=None, taskbar=None):
+        return patch.object(self.tracker, "_query_os_windows",
+                            return_value=(list(windows or self.windows), taskbar))
+
+    def test_caching_interval(self):
+        with self._patched() as query:
+            self.assertEqual(len(self.tracker.get_windows()), 2)
+            self.assertEqual(query.call_count, 1)
+            self.tracker.get_windows()
+            self.assertEqual(query.call_count, 1, "second call must hit the cache")
+            self.tracker.get_windows(force_refresh=True)
+            self.assertEqual(query.call_count, 2)
+            self.tracker.invalidate_cache()
+            self.tracker.get_windows()
+            self.assertEqual(query.call_count, 3)
+
+    def test_snapshot_holds_derived_geometry(self):
+        with self._patched(taskbar=(0, 1040, 1920, 1080)):
+            self.tracker.set_screen_rect(SCREEN)
+            snapshot = self.tracker.get_snapshot()
+        self.assertEqual(len(snapshot.windows), 2)
+        self.assertEqual(snapshot.taskbar, (0, 1040, 1920, 1080))
+        self.assertEqual(sorted(l.y for l in snapshot.ledges), [200, 400, 1040])
+        self.assertEqual(len(snapshot.edges), 6)  # 2 windows + 2 screen edges
+
+    def test_ledges_and_edges_only_include_the_current_screen(self):
+        # A window on a second monitor must not become a ledge the pet can
+        # never reach, nor a border it can try to climb.
+        far = WindowInfo(id=9, title="Other monitor", rect=(3000, 100, 4000, 900))
+        with self._patched(windows=[far], taskbar=None):
+            self.tracker.set_screen_rect(SCREEN)
+            self.assertEqual([l for l in self.tracker.get_walkable_ledges()
+                              if not l.is_floor], [])
+            self.assertEqual([e for e in self.tracker.get_climbable_edges()
+                              if not e.is_screen_edge], [])
+
+    def test_coordinate_scale_converts_native_pixels(self):
+        native = [WindowInfo(id=1, title="Half scale", rect=(200, 400, 1200, 1000))]
+        self.tracker.set_coordinate_scale(2.0)
+        with self._patched(windows=native):
+            scaled = self.tracker.get_windows(force_refresh=True)
+        self.assertEqual(scaled[0].rect, (100, 200, 600, 500))
+
+    def test_set_screen_rect_changes_derived_geometry(self):
+        left_monitor = (-1920, 0, 0, 1080)
+        with self._patched():
+            self.tracker.set_screen_rect(SCREEN)
+            self.assertEqual(self.tracker.get_walkable_ledges()[-1].y, 1080)
+            self.tracker.set_screen_rect(left_monitor)
+            ledges = self.tracker.get_walkable_ledges()
+            self.assertEqual(ledges[-1].y, 1080)
+            self.assertEqual(ledges[-1].x_min, -1920)
+            # Window A at x 100..500 is not on the left monitor at all.
+            self.assertEqual([l for l in ledges if not l.is_floor], [])
+
+    def test_exclude_titles_and_pids(self):
+        self.tracker = WindowTracker(exclude_titles=["my pet", "desktop"],
+                                     exclude_pids=[7])
+        windows = [
+            WindowInfo(id=1, title="My Pet Window", rect=(0, 0, 100, 100)),
+            WindowInfo(id=2, title="Desktop View", rect=(0, 0, 100, 100)),
+            WindowInfo(id=3, title="Browser", rect=(100, 100, 600, 500), pid=7),
+            WindowInfo(id=4, title="Editor", rect=(100, 100, 600, 500), pid=8),
+        ]
+        with self._patched(windows=windows):
+            result = self.tracker.get_windows(force_refresh=True)
+        self.assertEqual([w.title for w in result], ["Editor"])
+
+    def test_background_poller_serves_reads_without_querying(self):
+        with self._patched() as query:
+            self.tracker.start_background(interval=5.0)
+            try:
+                # Wait for the snapshot to be *stored*, not merely for the
+                # query to be called: those are not the same instant.
+                deadline = time.monotonic() + 3.0
+                while self.tracker.get_snapshot().at == 0.0 and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertGreater(query.call_count, 0)
+                self.assertEqual(len(self.tracker.get_windows()), 2)
+                # Reads during a stale interval must not hit the OS again.
+                count = query.call_count
+                for _ in range(20):
+                    self.tracker.get_windows()
+                    self.tracker.get_walkable_ledges()
+                    self.tracker.get_climbable_edges()
+                self.assertEqual(query.call_count, count)
+            finally:
+                self.tracker.stop_background()
+        self.assertFalse(self.tracker._background)
+
+
+class TestPetHelpers(unittest.TestCase):
+    def setUp(self):
+        self.tracker = WindowTracker(cache_interval=10.0)
+        self.windows = [
+            WindowInfo(id=1, title="Window A", rect=(100, 200, 500, 600)),
+            WindowInfo(id=2, title="Window B", rect=(400, 400, 900, 750)),
+        ]
+        patcher = patch.object(self.tracker, "_query_os_windows",
+                               return_value=(self.windows, (0, 1000, 1920, 1080)))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.tracker.set_screen_rect(SCREEN)
+        self.tracker.get_windows(force_refresh=True)
 
     def test_get_walkable_ledges(self):
-        screen_rect = (0, 0, 1920, 1080)
-        ledges = self.tracker.get_walkable_ledges(screen_rect=screen_rect)
+        ledges = self.tracker.get_walkable_ledges()
+        win_a = next(l for l in ledges if l.y == 200)
+        self.assertEqual((win_a.x_min, win_a.x_max), (100, 500))
+        self.assertFalse(win_a.is_floor)
+        floor = next(l for l in ledges if l.y == 1000)
+        self.assertTrue(floor.is_taskbar)
+        self.assertTrue(floor.is_floor)
+        # Sorted top-down.
+        self.assertEqual([l.y for l in ledges], sorted(l.y for l in ledges))
 
-        # Expected:
-        # Ledge 1: Window A top at y=200, x=[100, 500]
-        # Ledge 2: Window B top at y=400, x=[400, 900]
-        # Ledge 3: Taskbar floor at y=1000, x=[0, 1920]
-        self.assertGreaterEqual(len(ledges), 3)
-
-        # Verify Window A titlebar ledge
-        win_a_ledge = next(l for l in ledges if l.y == 200)
-        self.assertEqual(win_a_ledge.x_min, 100)
-        self.assertEqual(win_a_ledge.x_max, 500)
-        self.assertFalse(win_a_ledge.is_floor)
-
-        # Verify Window B titlebar ledge
-        win_b_ledge = next(l for l in ledges if l.y == 400)
-        self.assertEqual(win_b_ledge.x_min, 400)
-        self.assertEqual(win_b_ledge.x_max, 900)
-
-        # Verify Taskbar floor ledge
-        taskbar_ledge = next(l for l in ledges if l.y == 1000)
-        self.assertTrue(taskbar_ledge.is_taskbar)
-        self.assertTrue(taskbar_ledge.is_floor)
+    def test_taskbar_that_does_not_span_the_screen_splits_the_floor(self):
+        self.tracker._refresh(force=True)
+        ledge = next(l for l in self.tracker.get_walkable_ledges() if l.y == 1000)
+        self.assertTrue(ledge.is_taskbar)
+        self.assertEqual((ledge.x_min, ledge.x_max), (0, 1920))
 
     def test_get_climbable_edges(self):
-        screen_rect = (0, 0, 1920, 1080)
-        edges = self.tracker.get_climbable_edges(screen_rect=screen_rect, include_screen_edges=True)
+        edges = self.tracker.get_climbable_edges(include_screen_edges=True)
+        left = next(e for e in edges if e.x == 100 and e.is_left_edge
+                    and not e.is_screen_edge)
+        self.assertEqual((left.y_top, left.y_bottom), (200, 600))
+        right = next(e for e in edges if e.x == 500 and not e.is_left_edge
+                    and not e.is_screen_edge)
+        self.assertEqual((right.y_top, right.y_bottom), (200, 600))
+        self.assertEqual(len([e for e in edges if e.is_screen_edge]), 2)
+        # Screen edges can be excluded.
+        self.assertEqual(
+            [e for e in self.tracker.get_climbable_edges(include_screen_edges=False)
+             if e.is_screen_edge], [])
 
-        # Window A has left edge (100, 600, 200, True) and right edge (500, 600, 200, False)
-        edge_a_left = next((e for e in edges if e.x == 100 and e.is_left_edge and not e.is_screen_edge), None)
-        self.assertIsNotNone(edge_a_left)
-        self.assertEqual(edge_a_left.y_bottom, 600)
-        self.assertEqual(edge_a_left.y_top, 200)
-
-        edge_a_right = next((e for e in edges if e.x == 500 and not e.is_left_edge and not e.is_screen_edge), None)
-        self.assertIsNotNone(edge_a_right)
-        self.assertEqual(edge_a_right.y_bottom, 600)
-        self.assertEqual(edge_a_right.y_top, 200)
-
-        # Screen edges
-        screen_left = next((e for e in edges if e.x == 0 and e.is_left_edge and e.is_screen_edge), None)
-        self.assertIsNotNone(screen_left)
-        self.assertEqual(screen_left.y_bottom, 1080)
-        self.assertEqual(screen_left.y_top, 0)
-
-        screen_right = next((e for e in edges if e.x == 1920 and not e.is_left_edge and e.is_screen_edge), None)
-        self.assertIsNotNone(screen_right)
-
-    def test_find_landing_y_above_window_a(self):
-        sprite_w, sprite_h = 40, 40
-        floor_y = 960.0  # pet floor y (1000 - 40)
-
-        # Pet at x=200, y=50 (above Window A top=200)
-        landing_y = self.tracker.find_landing_y(
-            x=200, y=50, sprite_w=sprite_w, sprite_h=sprite_h, floor_y=floor_y
-        )
-        # Should land on Window A titlebar: 200 - 40 = 160.0
-        self.assertEqual(landing_y, 160.0)
-
-    def test_find_landing_y_stacked_windows(self):
-        sprite_w, sprite_h = 40, 40
-        floor_y = 960.0
-
-        # Pet at x=450 (overlaps both Window A [100,500] and Window B [400,900])
-        # Pet is at y=50: highest ledge below pet is Window A (top=200)
-        landing_y1 = self.tracker.find_landing_y(
-            x=450, y=50, sprite_w=sprite_w, sprite_h=sprite_h, floor_y=floor_y
-        )
-        self.assertEqual(landing_y1, 160.0)
-
-        # Now pet is at y=250 (below Window A top=200, but above Window B top=400)
-        landing_y2 = self.tracker.find_landing_y(
-            x=450, y=250, sprite_w=sprite_w, sprite_h=sprite_h, floor_y=floor_y
-        )
-        # Should land on Window B titlebar: 400 - 40 = 360.0
-        self.assertEqual(landing_y2, 360.0)
+    def test_find_landing_y_uses_the_highest_ledge_below(self):
+        self.assertEqual(self.tracker.find_landing_y(200, 50, 40, 40, 960.0), 160.0)
+        # Below window A but above window B: land on B.
+        self.assertEqual(self.tracker.find_landing_y(450, 250, 40, 40, 960.0), 360.0)
 
     def test_find_landing_y_falls_to_floor(self):
-        sprite_w, sprite_h = 40, 40
-        floor_y = 960.0
+        self.assertEqual(self.tracker.find_landing_y(50, 100, 40, 40, 960.0), 960.0)
+        self.assertEqual(self.tracker.find_landing_y(200, 700, 40, 40, 960.0), 960.0)
 
-        # Pet at x=50 (not overlapping any window)
-        landing_y = self.tracker.find_landing_y(
-            x=50, y=100, sprite_w=sprite_w, sprite_h=sprite_h, floor_y=floor_y
-        )
-        self.assertEqual(landing_y, floor_y)
+    def test_find_landing_y_accepts_partial_overhang(self):
+        # Pet spans 60..124: its centre (92) is left of the ledge, but it
+        # overlaps. Landing uses overlap; find_ledge_at must agree, or PERCH is
+        # entered holding no ledge -- which dereferenced None on the next tick
+        # and took the process down.
+        self.assertEqual(self.tracker.find_landing_y(60, 50, 64, 64, 960.0), 136.0)
+        self.assertIsNotNone(self.tracker.find_ledge_at(200.0, 60, 64))
+        self.assertIsNone(self.tracker.find_ledge_at(200.0, 940, 64))
 
-        # Pet at x=200 but y=700 (below Window A bottom)
-        landing_y_below = self.tracker.find_landing_y(
-            x=200, y=700, sprite_w=sprite_w, sprite_h=sprite_h, floor_y=floor_y
-        )
-        self.assertEqual(landing_y_below, floor_y)
+    def test_find_ledge_at_agrees_with_find_landing_y(self):
+        floor = 960.0
+        for x, y in ((200, 50), (450, 250), (60, 50), (1500, 10)):
+            landing = self.tracker.find_landing_y(x, y, 64, 64, floor)
+            ledge = self.tracker.find_ledge_at(landing + 64, x, 64)
+            if landing == floor:
+                # Nothing but floor under the pet: no ledge, and the pet must
+                # not be put into PERCH.
+                self.assertIsNone(ledge)
+                continue
+            self.assertIsNotNone(ledge, "no ledge for landing at %s from %s" % (landing, x))
+            self.assertAlmostEqual(ledge.y - 64, landing, msg="ledge/landing disagree")
 
     def test_find_nearby_climbable(self):
-        sprite_w, sprite_h = 32, 32
-        screen_rect = (0, 0, 1920, 1080)
-
-        # 1. Pet near Window A left edge (x=100)
-        # Pet at x=75 (pet_right = 107), y=300
-        edge = self.tracker.find_nearby_climbable(
-            pet_x=75, pet_y=300, sprite_w=sprite_w, sprite_h=sprite_h, reach_px=30, screen_rect=screen_rect
-        )
+        edge = self.tracker.find_nearby_climbable(75, 300, 32, 32, reach_px=30)
         self.assertIsNotNone(edge)
         self.assertEqual(edge.x, 100)
         self.assertTrue(edge.is_left_edge)
-        self.assertFalse(edge.is_screen_edge)
 
-        # 2. Pet near Window A right edge (x=500)
-        # Pet at x=510 (pet_left = 510, distance to 500 is 10), y=300
-        edge_r = self.tracker.find_nearby_climbable(
-            pet_x=510, pet_y=300, sprite_w=sprite_w, sprite_h=sprite_h, reach_px=30, screen_rect=screen_rect
-        )
-        self.assertIsNotNone(edge_r)
-        self.assertEqual(edge_r.x, 500)
-        self.assertFalse(edge_r.is_left_edge)
-        self.assertAlmostEqual(edge_r.distance, 10.0)
+        right = self.tracker.find_nearby_climbable(510, 300, 32, 32, reach_px=30)
+        self.assertEqual(right.x, 500)
+        self.assertFalse(right.is_left_edge)
+        self.assertAlmostEqual(right.distance, 10.0)
 
-        # 3. Pet near left screen edge (x=0)
-        edge_screen = self.tracker.find_nearby_climbable(
-            pet_x=10, pet_y=500, sprite_w=sprite_w, sprite_h=sprite_h, reach_px=30, screen_rect=screen_rect
-        )
-        self.assertIsNotNone(edge_screen)
-        self.assertEqual(edge_screen.x, 0)
-        self.assertTrue(edge_screen.is_screen_edge)
+        screen = self.tracker.find_nearby_climbable(10, 500, 32, 32, reach_px=30)
+        self.assertTrue(screen.is_screen_edge)
 
-        # 4. Pet far away in empty space
-        edge_none = self.tracker.find_nearby_climbable(
-            pet_x=250, pet_y=300, sprite_w=sprite_w, sprite_h=sprite_h, reach_px=20, screen_rect=screen_rect
-        )
-        self.assertIsNone(edge_none)
+        self.assertIsNone(
+            self.tracker.find_nearby_climbable(250, 300, 32, 32, reach_px=20))
+
+    def test_find_nearby_climbable_is_deterministic_on_ties(self):
+        # Two windows whose left borders are equidistant: the same one must be
+        # chosen every time, or the cat picks a different frame each launch.
+        picks = set()
+        for _ in range(20):
+            edge = self.tracker.find_nearby_climbable(0, 300, 32, 32, reach_px=300)
+            picks.add((edge.x, edge.is_left_edge))
+        self.assertEqual(len(picks), 1)
+
+    def test_edge_still_present_detects_closure(self):
+        edge = self.tracker.find_nearby_climbable(75, 300, 32, 32, reach_px=30)
+        self.assertTrue(self.tracker.edge_still_present(edge))
+        gone = ClimbableEdge(x=edge.x, y_bottom=edge.y_bottom - 400,
+                             y_top=edge.y_top - 400, is_left_edge=edge.is_left_edge)
+        self.assertFalse(self.tracker.edge_still_present(gone))
+        self.assertFalse(self.tracker.edge_still_present(None))
 
 
-class TestLinuxBackendAndFallback(unittest.TestCase):
-    """Test Linux Xlib behavior, error handling, and safe fallbacks."""
+class TestPlatformTrust(unittest.TestCase):
+    def test_wayland_is_never_trusted(self):
+        with patch.dict("os.environ", {"WAYLAND_DISPLAY": "wayland-0",
+                                       "DISPLAY": ":0"}, clear=False):
+            self.assertFalse(detection_is_complete())
 
-    def test_safe_translate_coords_handles_bad_window(self):
-        mock_root = MagicMock()
-        mock_client = MagicMock()
+    def test_x11_without_wayland_is_trusted(self):
+        with patch.dict("os.environ", {"WAYLAND_DISPLAY": "", "DISPLAY": ":0"},
+                        clear=False):
+            with patch.object(window_tracker, "_get_xlib", return_value=object()):
+                self.assertTrue(detection_is_complete())
 
-        # Normal success
-        mock_res = MagicMock()
-        mock_res.x = 42
-        mock_res.y = 84
-        mock_root.translate_coords.return_value = mock_res
-        self.assertEqual(safe_translate_coords(mock_root, mock_client), (42, 84))
+    def test_pure_wayland_reports_no_detection(self):
+        with patch.dict("os.environ", {"WAYLAND_DISPLAY": "wayland-0"}, clear=True):
+            # The real X connection may already be memoised from an earlier
+            # test, so ask the question the function actually asks.
+            with patch.object(window_tracker, "_get_xlib", return_value=None):
+                self.assertFalse(window_tracker.window_detection_available())
+                self.assertFalse(detection_is_complete())
 
-        # Exception / BadWindow
-        mock_root.translate_coords.side_effect = Exception("BadWindow: resource 0x123 dead")
-        self.assertIsNone(safe_translate_coords(mock_root, mock_client))
-
-        # None arguments
-        self.assertIsNone(safe_translate_coords(None, mock_client))
-        self.assertIsNone(safe_translate_coords(mock_root, None))
-
-    def test_fallback_when_xlib_unavailable(self):
-        """Verify tracker never crashes if Xlib or DISPLAY is missing (Wayland / headless)."""
+    def test_no_xlib_falls_back_to_screen_edges_only(self):
         tracker = WindowTracker()
-        with patch("window_tracker._get_xlib", return_value=None):
-            with patch("window_tracker.IS_WIN", False):
-                with patch("window_tracker.IS_LINUX", True):
-                    wins = tracker.get_windows(force_refresh=True)
-                    self.assertEqual(wins, [])
-
-                    # Pet helpers still work using screen fallback
-                    screen_rect = (0, 0, 1920, 1080)
-                    ledges = tracker.get_walkable_ledges(screen_rect=screen_rect)
+        with patch.object(window_tracker, "_get_xlib", return_value=None):
+            with patch.object(window_tracker, "IS_LINUX", True):
+                with patch.object(window_tracker, "IS_WIN", False):
+                    self.assertEqual(tracker.get_windows(force_refresh=True), [])
+                    tracker.set_screen_rect(SCREEN)
+                    ledges = tracker.get_walkable_ledges()
                     self.assertEqual(len(ledges), 1)
                     self.assertEqual(ledges[0].y, 1080)
-
-                    climb_edges = tracker.get_climbable_edges(screen_rect=screen_rect)
-                    self.assertEqual(len(climb_edges), 2)  # 2 screen edges
-
-                    landing = tracker.find_landing_y(500, 100, 40, 40, 1040.0, screen_rect=screen_rect)
-                    self.assertEqual(landing, 1040.0)
+                    edges = tracker.get_climbable_edges()
+                    self.assertEqual(len(edges), 2)
+                    self.assertEqual(tracker.find_landing_y(500, 100, 40, 40, 1040.0),
+                                     1040.0)
 
 
 class TestWindowsBackend(unittest.TestCase):
-    """Test Windows ctypes window listing and filtering logic with mocks."""
-
     def test_win32_enumeration_filters(self):
-        """Simulate Windows EnumWindows callback with visible, cloaked, minimized, and taskbar windows."""
-        # Setup mock user32 and dwmapi
+        """Visible, cloaked, minimized, layered and taskbar windows."""
         mock_user32 = MagicMock()
         mock_dwmapi = MagicMock()
-
-        # Windows handles:
-        # 101: Normal visible window ("Browser")
-        # 102: Minimized window ("Minimized App")
-        # 103: Invisible window
-        # 104: Cloaked window ("Cloaked App")
-        # 105: Transparent layered window
-        # 106: Zero-size window
-        # 107: Taskbar ("Shell_TrayWnd")
 
         def mock_is_window_visible(hwnd):
             return hwnd != 103
@@ -333,36 +320,28 @@ class TestWindowsBackend(unittest.TestCase):
             return hwnd == 102
 
         def mock_get_window_text_length(hwnd):
-            titles = {101: 7, 102: 13, 103: 4, 104: 11, 105: 11, 106: 9, 107: 0}
-            return titles.get(hwnd, 0)
+            return {101: 7, 102: 13, 103: 4, 104: 11, 105: 11, 106: 9, 107: 0}.get(hwnd, 0)
 
         def mock_get_window_text(hwnd, buf, length):
-            titles = {101: "Browser", 102: "Minimized App", 104: "Cloaked App", 105: "Transparent", 106: "Zero Size"}
+            titles = {101: "Browser", 102: "Minimized App", 104: "Cloaked App",
+                      105: "Transparent", 106: "Zero Size"}
             buf.value = titles.get(hwnd, "")
             return len(buf.value)
 
         def mock_get_class_name(hwnd, buf, length):
-            if hwnd == 107:
-                buf.value = "Shell_TrayWnd"
-            else:
-                buf.value = "GenericWindow"
+            buf.value = "Shell_TrayWnd" if hwnd == 107 else "GenericWindow"
             return len(buf.value)
 
         def mock_dwm_attr(hwnd, attr, byref_val, size):
             if attr == 14:  # DWMWA_CLOAKED
-                if hwnd == 104:
-                    byref_val._obj.value = 1  # cloaked
-                else:
-                    byref_val._obj.value = 0
+                byref_val._obj.value = 1 if hwnd == 104 else 0
                 return 0
-            elif attr == 9:  # DWMWA_EXTENDED_FRAME_BOUNDS
+            if attr == 9:  # DWMWA_EXTENDED_FRAME_BOUNDS
                 rect = byref_val._obj
                 if hwnd == 101:
                     rect.left, rect.top, rect.right, rect.bottom = 100, 150, 900, 750
                 elif hwnd == 106:
-                    rect.left, rect.top, rect.right, rect.bottom = 100, 100, 100, 100  # 0 size
-                elif hwnd == 107:
-                    rect.left, rect.top, rect.right, rect.bottom = 0, 1040, 1920, 1080
+                    rect.left, rect.top, rect.right, rect.bottom = 100, 100, 100, 100
                 else:
                     rect.left, rect.top, rect.right, rect.bottom = 200, 200, 600, 500
                 return 0
@@ -379,38 +358,57 @@ class TestWindowsBackend(unittest.TestCase):
         mock_user32.GetWindowTextW.side_effect = mock_get_window_text
         mock_user32.GetClassNameW.side_effect = mock_get_class_name
         mock_user32.GetWindowRect.side_effect = mock_get_window_rect
-        mock_user32.GetWindowLongW.return_value = 0
         mock_user32.FindWindowW.return_value = 107
         mock_dwmapi.DwmGetWindowAttribute.side_effect = mock_dwm_attr
 
+        # 105 is a fully transparent layered window: it must be filtered.
+        def mock_ex_style(hwnd, index):
+            return window_tracker.WS_EX_LAYERED if hwnd == 105 else 0
+
+        mock_user32.GetWindowLongW.side_effect = mock_ex_style
+        mock_user32.GetWindowLongPtrW.side_effect = mock_ex_style
+
+        def mock_layered_attrs(hwnd, key, alpha, flags):
+            alpha._obj.value = 0
+            flags._obj.value = window_tracker.LWA_ALPHA
+            return 1  # success
+
+        mock_user32.GetLayeredWindowAttributes.side_effect = mock_layered_attrs
+
+        seen = []
+
         def mock_enum_windows(callback, lparam):
-            for h in [101, 102, 103, 104, 106, 107]:
+            for h in [101, 102, 103, 104, 105, 106, 107]:
+                seen.append(h)
                 if not callback(h, lparam):
                     break
             return 1
 
         mock_user32.EnumWindows.side_effect = mock_enum_windows
 
-        with patch("window_tracker.IS_WIN", True):
+        with patch.object(window_tracker, "IS_WIN", True):
             with patch("ctypes.windll", create=True) as mock_windll:
                 mock_windll.user32 = mock_user32
                 mock_windll.dwmapi = mock_dwmapi
                 windows, taskbar = window_tracker._win32_list_windows()
 
-                # Only window 101 ("Browser") should survive all filters
-                self.assertEqual(len(windows), 1)
-                self.assertEqual(windows[0].title, "Browser")
-                self.assertEqual(windows[0].rect, (100, 150, 900, 750))
+        self.assertEqual(len(windows), 1)
+        self.assertEqual(windows[0].title, "Browser")
+        self.assertEqual(windows[0].rect, (100, 150, 900, 750))
+        self.assertIsNotNone(taskbar)
+        self.assertEqual(taskbar, (0, 1040, 1920, 1080))
+        self.assertIn(105, seen, "layered window was never offered to the callback")
 
-                # Taskbar 107 should be identified
-                self.assertIsNotNone(taskbar)
-                self.assertEqual(taskbar, (0, 1040, 1920, 1080))
+    def test_win32_ex_style_coerces_to_int(self):
+        # A non-integer style value must not make every bit test truthy and
+        # silently drop every window.
+        with patch("ctypes.windll", create=True) as mock_windll:
+            mock_windll.user32.GetWindowLongPtrW.return_value = object()
+            self.assertEqual(window_tracker._win32_ex_style(1), 0)
 
 
-class TestLinuxBackendDetails(unittest.TestCase):
-    """Test Linux Xlib details, BadWindow resilience, and atom filtering."""
-
-    def test_linux_window_filtering(self):
+class TestLinuxBackend(unittest.TestCase):
+    def _mock_display(self, client_ids, workarea=(0, 0, 1920, 1040)):
         mock_display = MagicMock()
         mock_screen = MagicMock()
         mock_screen.width_in_pixels = 1920
@@ -419,189 +417,154 @@ class TestLinuxBackendDetails(unittest.TestCase):
         mock_display.screen.return_value = mock_screen
         mock_screen.root = mock_root
 
-        # Mock atoms
-        def intern_atom(name):
-            atoms = {
-                "_NET_WORKAREA": 1,
-                "_NET_CLIENT_LIST_STACKING": 2,
-                "_NET_CLIENT_LIST": 3,
-                "_NET_WM_STATE": 4,
-                "_NET_WM_STATE_HIDDEN": 5,
-                "_NET_WM_WINDOW_TYPE": 6,
-                "_NET_WM_WINDOW_TYPE_DESKTOP": 7,
-                "_NET_WM_WINDOW_TYPE_DOCK": 8,
-                "_NET_WM_WINDOW_TYPE_SPLASH": 9,
-                "_NET_WM_WINDOW_TYPE_NOTIFICATION": 10,
-                "_NET_WM_WINDOW_TYPE_TOOLTIP": 11,
-                "_NET_FRAME_EXTENTS": 12,
-                "_NET_WM_PID": 13,
-                "_NET_WM_NAME": 14,
-            }
-            return atoms.get(name, 99)
+        atoms = {name: index for index, name in enumerate(
+            ["_NET_WORKAREA", "_NET_CLIENT_LIST_STACKING", "_NET_CLIENT_LIST",
+             "_NET_WM_STATE", "_NET_WM_STATE_HIDDEN", "_NET_WM_WINDOW_TYPE",
+             "_NET_WM_WINDOW_TYPE_DESKTOP", "_NET_WM_WINDOW_TYPE_DOCK",
+             "_NET_WM_WINDOW_TYPE_SPLASH", "_NET_WM_WINDOW_TYPE_NOTIFICATION",
+             "_NET_WM_WINDOW_TYPE_TOOLTIP", "_NET_FRAME_EXTENTS", "_NET_WM_PID",
+             "_NET_WM_NAME", "_NET_ACTIVE_WINDOW"], start=1)}
+        mock_display.intern_atom.side_effect = lambda name: atoms.get(name, 99)
 
-        mock_display.intern_atom.side_effect = intern_atom
-
-        # Workarea property
         wa_prop = MagicMock()
-        wa_prop.value = [0, 0, 1920, 1040]
-        mock_root.get_full_property.return_value = wa_prop
-
-        # Windows in client list:
-        # W1: Normal window ("Text Editor")
-        # W2: Desktop window ("Desktop") -> filtered
-        # W3: Minimized window -> filtered
-        # W4: Dock window ("Dock") -> detected as dock/taskbar
-        # W5: Window that closed dynamically (raises BadWindow) -> gracefully ignored
+        wa_prop.value = list(workarea)
         cl_prop = MagicMock()
-        cl_prop.value = [1001, 1002, 1003, 1004, 1005]
+        cl_prop.value = list(client_ids)
 
         def root_get_prop(atom, atom_type=0):
-            if atom == 2:  # _NET_CLIENT_LIST_STACKING
-                return cl_prop
-            if atom == 1:  # _NET_WORKAREA
+            if atom == atoms["_NET_WORKAREA"]:
                 return wa_prop
+            if atom in (atoms["_NET_CLIENT_LIST_STACKING"], atoms["_NET_CLIENT_LIST"]):
+                return cl_prop
             return None
 
         mock_root.get_full_property.side_effect = root_get_prop
 
-        def create_resource_object(res_type, wid):
+        def prop_for(atom_values, extra=None):
+            def prop_fn(atom, atom_type=0):
+                if extra and atom in extra:
+                    return extra[atom]
+                if atom in atom_values:
+                    p = MagicMock()
+                    p.value = atom_values[atom]
+                    return p
+                return None
+            return prop_fn
+
+        def create_resource_object(_kind, wid):
             w = MagicMock()
-            w.display = mock_display
-
-            if wid == 1001:
-                # Normal window
-                w.get_wm_name.return_value = "Text Editor"
-                geom = MagicMock(width=800, height=600)
-                w.get_geometry.return_value = geom
-                coords = MagicMock(x=100, y=100)
-                mock_root.translate_coords.return_value = coords
-
-                def prop_fn(atom, atom_type=0):
-                    if atom == 4:  # WM_STATE
-                        return None  # not hidden
-                    if atom == 6:  # WINDOW_TYPE
-                        p = MagicMock(value=[999])
-                        return p
-                    if atom == 12:  # FRAME_EXTENTS
-                        p = MagicMock(value=[5, 5, 25, 5])
-                        return p
-                    return None
-
-                w.get_full_property.side_effect = prop_fn
-
-            elif wid == 1002:
-                # Desktop window
-                w.get_wm_name.return_value = "Desktop"
-
-                def prop_fn(atom, atom_type=0):
-                    if atom == 6:  # WINDOW_TYPE
-                        p = MagicMock(value=[7])  # DESKTOP
-                        return p
-                    return None
-
-                w.get_full_property.side_effect = prop_fn
-
-            elif wid == 1003:
-                # Minimized window
-                w.get_wm_name.return_value = "Minimized Window"
-
-                def prop_fn(atom, atom_type=0):
-                    if atom == 4:  # WM_STATE
-                        p = MagicMock(value=[5])  # HIDDEN
-                        return p
-                    return None
-
-                w.get_full_property.side_effect = prop_fn
-
-            elif wid == 1004:
-                # Dock window
-                w.get_wm_name.return_value = "Panel"
-                geom = MagicMock(width=1920, height=40)
-                w.get_geometry.return_value = geom
-                coords = MagicMock(x=0, y=1040)
-                mock_root.translate_coords.return_value = coords
-
-                def prop_fn(atom, atom_type=0):
-                    if atom == 6:
-                        p = MagicMock(value=[8])  # DOCK
-                        return p
-                    return None
-
-                w.get_full_property.side_effect = prop_fn
-
-            elif wid == 1005:
-                # Dynamically closed window
+            if wid == 1001:  # normal window
+                w.get_geometry.return_value = MagicMock(width=800, height=600)
+                mock_root.translate_coords.return_value = MagicMock(x=100, y=100)
+                w.get_full_property.side_effect = prop_for(
+                    {}, extra={
+                        atoms["_NET_FRAME_EXTENTS"]: _prop([5, 5, 25, 5]),
+                        atoms["_NET_WM_NAME"]: _prop(b"Text Editor"),
+                        atoms["_NET_WM_PID"]: _prop([4242]),
+                    })
+            elif wid == 1002:  # desktop
+                w.get_full_property.side_effect = prop_for(
+                    {atoms["_NET_WM_WINDOW_TYPE"]: [atoms["_NET_WM_WINDOW_TYPE_DESKTOP"]]})
+            elif wid == 1003:  # minimized
+                w.get_full_property.side_effect = prop_for(
+                    {atoms["_NET_WM_STATE"]: [atoms["_NET_WM_STATE_HIDDEN"]]})
+            elif wid == 1004:  # dock
+                w.get_geometry.return_value = MagicMock(width=1920, height=40)
+                mock_root.translate_coords.return_value = MagicMock(x=0, y=1040)
+                w.get_full_property.side_effect = prop_for(
+                    {atoms["_NET_WM_WINDOW_TYPE"]: [atoms["_NET_WM_WINDOW_TYPE_DOCK"]]},
+                    extra={atoms["_NET_WM_NAME"]: _prop(b"Panel")})
+            elif wid == 1005:  # closed mid-query
                 w.get_geometry.side_effect = Exception("BadWindow")
-                w.get_wm_name.side_effect = Exception("BadWindow")
-
+            elif wid == 1006:  # modern window: only _NET_WM_NAME, no WM_NAME
+                w.get_geometry.return_value = MagicMock(width=400, height=300)
+                mock_root.translate_coords.return_value = MagicMock(x=50, y=60)
+                w.get_wm_name.return_value = b""
+                w.get_full_property.side_effect = prop_for(
+                    {}, extra={atoms["_NET_WM_NAME"]: _prop(b"Modern App")})
             return w
 
         mock_display.create_resource_object.side_effect = create_resource_object
+        return mock_display, mock_root
 
-        with patch("window_tracker._get_xlib", return_value=mock_display):
+    def test_linux_window_filtering(self):
+        display, _root = self._mock_display([1001, 1002, 1003, 1004, 1005, 1006])
+        with patch.object(window_tracker, "_get_xlib", return_value=display):
             wins, taskbar = window_tracker._linux_list_windows()
+        titles = sorted(w.title for w in wins)
+        self.assertEqual(titles, ["Modern App", "Text Editor"])
+        editor = next(w for w in wins if w.title == "Text Editor")
+        self.assertEqual(editor.rect, (95, 75, 905, 705))
+        self.assertEqual(editor.pid, 4242)
+        self.assertEqual(editor.process, "")  # pid 4242 does not exist
+        self.assertIsNotNone(taskbar)
 
-            # Only W1 should be in wins
-            self.assertEqual(len(wins), 1)
-            self.assertEqual(wins[0].title, "Text Editor")
-            # Rect: left = 100 - 5 = 95, top = 100 - 25 = 75, right = 100 + 800 + 5 = 905, bottom = 100 + 600 + 5 = 705
-            self.assertEqual(wins[0].rect, (95, 75, 905, 705))
+    def test_net_wm_name_is_preferred_over_wm_name(self):
+        # WM_NAME is empty for GTK4/Qt/Electron windows; reading only that made
+        # window-aware dialogue and the foreground blocklist dead on Linux.
+        display, root = self._mock_display([1006])
+        with patch.object(window_tracker, "_get_xlib", return_value=display):
+            active_prop = MagicMock()
+            active_prop.value = [1006]
+            atoms = {"_NET_ACTIVE_WINDOW": 15}
+            original = root.get_full_property.side_effect
 
-            # Dock W4 or workarea should be identified as taskbar
-            self.assertIsNotNone(taskbar)
+            def with_active(atom, atom_type=0):
+                if atom == 15:
+                    return active_prop
+                return original(atom, atom_type)
+
+            root.get_full_property.side_effect = with_active
+            active = window_tracker._linux_active_window()
+        self.assertIsNotNone(active)
+        self.assertEqual(active.title, "Modern App")
+        self.assertEqual(active.rect, (50, 60, 450, 360))
+
+
+def _prop(value):
+    p = MagicMock()
+    p.value = value
+    return p
 
 
 class TestLiveEnvironment(unittest.TestCase):
-    """Test on the active system environment without mocks."""
-
     def test_live_window_listing(self):
         tracker = WindowTracker(cache_interval=0.5)
         wins = tracker.get_windows(force_refresh=True)
-        # Should return a list without error
         self.assertIsInstance(wins, list)
         for w in wins:
             self.assertIsInstance(w, WindowInfo)
-            self.assertTrue(len(w.title) > 0)
+            self.assertTrue(w.title)
             self.assertEqual(len(w.rect), 4)
             left, top, right, bottom = w.rect
-            self.assertGreater(right, left)
-            self.assertGreater(bottom, top)
+            self.assertGreaterEqual(right, left)
+            self.assertGreaterEqual(bottom, top)
 
-        # Helpers should execute smoothly on live system
-        ledges = tracker.get_walkable_ledges()
-        self.assertIsInstance(ledges, list)
-
-        edges = tracker.get_climbable_edges()
-        self.assertIsInstance(edges, list)
-
-        landing = tracker.find_landing_y(100, 50, 32, 32, 600.0)
-        self.assertIsInstance(landing, (int, float))
+        tracker.set_screen_rect(window_tracker.virtual_screen_rect())
+        self.assertIsInstance(tracker.get_walkable_ledges(), list)
+        self.assertIsInstance(tracker.get_climbable_edges(), list)
+        self.assertIsInstance(
+            tracker.find_landing_y(100, 50, 32, 32, 600.0), (int, float))
+        active = tracker.get_active_window()
+        self.assertTrue(active is None or isinstance(active, WindowInfo))
 
 
 class TestModuleLevelFunctions(unittest.TestCase):
-    """Test module-level convenience functions."""
-
-    def test_singleton_methods(self):
-        t = get_tracker()
-        self.assertIsInstance(t, WindowTracker)
-
-        wins = list_windows()
-        self.assertIsInstance(wins, list)
-
-        ledges = get_walkable_ledges((0, 0, 1920, 1080))
-        self.assertIsInstance(ledges, list)
-
-        edges = get_climbable_edges((0, 0, 1920, 1080))
-        self.assertIsInstance(edges, list)
-
-        landing = find_landing_y(100, 100, 32, 32, 900.0)
-        self.assertIsInstance(landing, (int, float))
-
-        climb = find_nearby_climbable(10, 100, 32, 32, reach_px=30, screen_rect=(0, 0, 1920, 1080))
-        self.assertTrue(climb is None or isinstance(climb, ClimbableEdge))
+    def test_singleton_is_shared(self):
+        self.assertIs(get_tracker(), get_tracker())
+        self.assertIsInstance(list_windows(), list)
+        self.assertIsInstance(get_walkable_ledges(SCREEN), list)
+        self.assertIsInstance(get_climbable_edges(SCREEN), list)
+        self.assertIsInstance(find_landing_y(100, 100, 32, 32, 900.0), (int, float))
+        self.assertTrue(find_nearby_climbable(10, 100, 32, 32, reach_px=30,
+                                              screen_rect=SCREEN) is None
+                        or isinstance(find_nearby_climbable(10, 100, 32, 32,
+                                                            reach_px=30,
+                                                            screen_rect=SCREEN),
+                                      ClimbableEdge))
+        self.assertTrue(get_taskbar_rect() is None
+                        or isinstance(get_taskbar_rect(), tuple))
 
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
-
-

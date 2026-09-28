@@ -1,111 +1,187 @@
 """
-companion_dialogue.py - Comprehensive In-Character Dialogue & Contextual Reaction Engine
-for Desktop Companion Pets (Cat, Shiba, Ghost, Jarvis, Ultron).
+companion_dialogue.py - In-character dialogue and contextual reactions for the
+desktop companions (Cat, Shiba, Ghost, Jarvis, Ultron).
 
-Provides:
-- COMPANION_DIALOGUE: Extensive canned quotes across window categories, time of day, and physical interactions.
-- Context evaluation helpers (categorize_window, get_time_of_day_key, get_contextual_quote, InteractionTracker).
+This module owns every line the pet can say without asking the model. The pet
+imports from here and nowhere else, so a companion's voice is defined in
+exactly one place.
+
+Provided:
+- COMPANION_DIALOGUE: quotes per skin, per window category, per time of day,
+  and per physical interaction (pet, drop, climb, perch, system state).
+- categorize_window / get_time_of_day_key / get_contextual_quote: the
+  selection logic.
+- InteractionTracker: spam detection for repeated petting.
 """
 
+import re
 import time
 import random
 from datetime import datetime
 
 # =====================================================================
 # WINDOW CLASSIFIER RULES
+#
+# Matching rules, because naive substring matching gets this badly wrong:
+#   * Process names are matched against the executable basename, on a
+#     segment boundary ("chrome" matches chrome, not "chroma-lab").
+#   * Title entries that look like file extensions (".py") must not be
+#     followed by another word character, otherwise ".c" matches every
+#     ".com"/".config" in existence.
+#   * A matching process outranks a matching title, so a browser tab titled
+#     "main.py" is browser, not coding.
 # =====================================================================
 WINDOW_CATEGORIES = {
     "coding": {
         "processes": [
-            "code", "code.exe", "cursor", "cursor.exe", "devenv.exe",
-            "pycharm", "pycharm64.exe", "idea", "idea64.exe", "clion", "clion64.exe",
-            "webstorm", "sublime_text", "atom", "gedit", "kate", "emacs",
+            "code", "cursor", "devenv", "pycharm", "idea", "clion", "webstorm",
+            "rider", "rubymine", "sublime_text", "atom", "gedit", "kate", "emacs",
+            "neovim", "vim", "nvim", "code-oss", "vscodium", "lite-xl",
         ],
         "titles": [
             "visual studio code", "vs code", "pycharm", "intellij", "clion",
-            "sublime text", "vim", "nvim", "neovim", "nano", "android studio",
-            ".py", ".js", ".ts", ".rs", ".go", ".cpp", ".c", ".java", ".html",
+            "webstorm", "sublime text", "neovim", "android studio", "stack overflow",
             "git commit", "merge conflict", "github", "gitlab",
+            # File extensions, matched on a non-word boundary.
+            ".py", ".js", ".ts", ".tsx", ".jsx", ".rs", ".go", ".cpp", ".hpp",
+            ".c", ".java", ".kt", ".rb", ".php", ".html", ".css", ".sql", ".sh",
         ],
     },
     "browser": {
         "processes": [
-            "chrome", "chrome.exe", "firefox", "firefox.exe", "msedge", "msedge.exe",
-            "brave", "brave.exe", "opera", "opera.exe", "vivaldi", "chromium", "safari",
+            "chrome", "firefox", "msedge", "brave", "opera", "vivaldi", "chromium",
+            "safari", "zen", "librewolf", "tor",
         ],
         "titles": [
-            "google chrome", "mozilla firefox", "microsoft edge", "brave",
+            "google chrome", "mozilla firefox", "microsoft edge", "brave browser",
             "new tab", "wikipedia", "stackoverflow", "reddit", "hacker news",
         ],
     },
     "chat": {
         "processes": [
-            "discord", "discord.exe", "slack", "slack.exe", "teams", "teams.exe",
-            "telegram", "telegram.exe", "whatsapp", "whatsapp.exe", "signal", "signal.exe",
-            "element", "thunderbird", "outlook.exe",
+            "discord", "slack", "teams", "telegram", "whatsapp", "signal",
+            "element", "thunderbird", "outlook", "hexchat", "weechat", "irc",
         ],
         "titles": [
-            "discord", "slack", "teams", "telegram", "whatsapp", "signal",
-            "direct message", "channel", "#general", "inbox", "meeting",
+            "discord", "slack", "microsoft teams", "telegram", "whatsapp",
+            "signal", "direct message", "inbox", "new message",
         ],
     },
     "media_gaming": {
         "processes": [
-            "steam", "steam.exe", "spotify", "spotify.exe", "vlc", "vlc.exe",
-            "epicgameslauncher.exe", "battlenet.exe", "heroic", "lutris",
-            "minecraft", "cs2", "dota2", "valorant", "overwatch", "r5apex",
+            "steam", "spotify", "vlc", "mpv", "heroic", "lutris", "minecraft",
+            "cs2", "dota2", "valorant", "overwatch", "r5apex", "ffmpeg", "obs",
         ],
         "titles": [
             "steam", "spotify", "youtube", "twitch", "netflix", "vlc media player",
-            "prime video", "soundcloud", "bandcamp", "game",
+            "prime video", "soundcloud", "bandcamp", "plex",
         ],
     },
     "terminal": {
         "processes": [
-            "bash", "zsh", "fish", "sh", "gnome-terminal-server", "konsole",
-            "alacritty", "kitty", "wezterm-gui", "xfce4-terminal", "foot",
-            "windows terminal", "windowsterminal.exe", "cmd.exe", "powershell.exe", "pwsh.exe",
+            "bash", "zsh", "fish", "sh", "dash", "ksh", "gnome-terminal",
+            "gnome-terminal-server", "konsole", "alacritty", "kitty", "wezterm",
+            "xfce4-terminal", "foot", "mate-terminal", "tilix", "terminator",
+            "windowsterminal", "cmd", "powershell", "pwsh",
         ],
         "titles": [
             "terminal", "bash", "zsh", "fish", "cmd.exe", "powershell",
-            "mingw", "cygwin", "wsl", "tmux", "ssh", "tony@",
+            "mingw", "cygwin", "wsl", "tmux", "ssh",
         ],
+        # ssh / scp style "user@host:" prompts, as a regex rather than a
+        # hardcoded hostname.
+        "title_patterns": [r"\S+@\S+[:~]"],
     },
 }
 
+_EXTENSION_RE_CACHE = {}
+
+
+def _title_matches(entry: str, title: str) -> bool:
+    """Match one title keyword against a window title."""
+    if entry.startswith("."):
+        # ".c" must not match ".com": require a non-word char (or end) after.
+        pattern = _EXTENSION_RE_CACHE.get(entry)
+        if pattern is None:
+            pattern = re.compile(re.escape(entry) + r"(?!\w)")
+            _EXTENSION_RE_CACHE[entry] = pattern
+        return pattern.search(title) is not None
+    return entry in title
+
+
+def _process_matches(entry: str, process: str) -> bool:
+    """Match one process name against an executable basename, on a segment
+    boundary so "code" does not match "chroma" or "keyboard-layout-x11"."""
+    if not process:
+        return False
+    name = process.rsplit("/", 1)[-1].rsplit("\\", 1)[-1].lower()
+    if name.endswith(".exe"):
+        name = name[:-4]
+    if name == entry:
+        return True
+    return name.startswith(entry) and name[len(entry)] in "-_. "
+
+
+def _title_categories(title: str, distinctive_only: bool):
+    """Categories whose title keywords match, in declared priority order."""
+    matched = []
+    for cat in ("coding", "chat", "media_gaming", "browser"):
+        for entry in WINDOW_CATEGORIES[cat]["titles"]:
+            if distinctive_only == entry.startswith("."):
+                continue
+            if _title_matches(entry, title):
+                matched.append(cat)
+                break
+    return matched
+
 
 def categorize_window(title: str, process: str) -> str:
-    """Matches window title and process name against category signatures."""
-    t = (title or "").lower()
-    p = (process or "").lower()
+    """Category for a window, or 'general'.
 
-    # Terminal check before coding/shell scripts
+    Precedence, and why:
+      1. A terminal process wins outright.
+      2. A distinctive title keyword ("youtube", "discord", "pycharm") beats the
+         process, so a browser tab playing a video gets the media line rather
+         than a generic "browsing" one.
+      3. Then the process name, so "main.py" open in a browser is a browser and
+         a file called "notes" opened in an editor is an editor.
+      4. Then generic title keywords -- the file extensions.
+    """
+    t = (title or "").lower()
+    p = process or ""
+
     for proc in WINDOW_CATEGORIES["terminal"]["processes"]:
-        if proc in p:
+        if _process_matches(proc, p):
             return "terminal"
-    for term_title in WINDOW_CATEGORIES["terminal"]["titles"]:
-        if term_title in t:
+
+    for pattern in WINDOW_CATEGORIES["terminal"].get("title_patterns", []):
+        if re.search(pattern, t):
             return "terminal"
+
+    distinctive = _title_categories(t, distinctive_only=True)
+    if distinctive:
+        return distinctive[0]
 
     for cat in ("coding", "chat", "media_gaming", "browser"):
         for proc in WINDOW_CATEGORIES[cat]["processes"]:
-            if proc in p:
+            if _process_matches(proc, p):
                 return cat
-        for kw in WINDOW_CATEGORIES[cat]["titles"]:
-            if kw in t:
-                return cat
+
+    generic = _title_categories(t, distinctive_only=False)
+    if generic:
+        return generic[0]
 
     return "general"
 
 
 def get_time_of_day_key(dt: datetime = None) -> str:
-    """Returns 'late_night', 'early_morning', 'afternoon_slump', or 'daytime'."""
+    """'late_night', 'early_morning', 'afternoon_slump', or 'daytime'."""
     hour = (dt or datetime.now()).hour
-    if 1 <= hour < 5:
+    if hour < 5:            # includes midnight, which used to read as "daytime"
         return "late_night"
-    elif 5 <= hour < 9:
+    if hour < 9:
         return "early_morning"
-    elif 13 <= hour < 17:
+    if 13 <= hour < 17:
         return "afternoon_slump"
     return "daytime"
 
@@ -252,6 +328,21 @@ COMPANION_DIALOGUE = {
             "warmest pixel ledge on the screen. dibs.",
             "overseeing your questionable workflow from above.",
         ],
+        "low_memory": [
+            "your ram is basically a parking lot right now",
+            "memory's nearly full. i'm choosing to blame the tabs.",
+            "close something. anything. i believe in you.",
+        ],
+        "low_battery": [
+            "battery's dying, drama ensues",
+            "low battery. i'm conserving emotional energy too.",
+            "plug in, or i'm narrating your final moments.",
+        ],
+        "screenshot_blocked": [
+            "not looking at that one. some things aren't mine to see.",
+            "i'm keeping my eyes to myself here.",
+            "privacy first. i'll describe your window instead.",
+        ],
     },
 
     # -----------------------------------------------------------------
@@ -383,6 +474,21 @@ COMPANION_DIALOGUE = {
             "holding down the window so it doesn't float away!!",
             "guarding your active window!! no bad vibes allowed!!",
             "perched like a mighty eagle!! a fluffy yellow eagle!!",
+        ],
+        "low_memory": [
+            "the computer is working SO hard, good job computer!!",
+            "your memory is full!! close a tab for me!!",
+            "too many tabs!! i believe in you!! you can do this!!",
+        ],
+        "low_battery": [
+            "low battery!! plug in!! i believe in you!!",
+            "battery getting sleepy!! same!! wake up!!",
+            "PLUG IN PLUG IN PLUG IN (barking)",
+        ],
+        "screenshot_blocked": [
+            "that window is not for me!! i am a good dog!!",
+            "polite!! i did not look!! promise!!",
+            "some screens are private!! i respect that!!",
         ],
     },
 
@@ -516,6 +622,21 @@ COMPANION_DIALOGUE = {
             "a ghostly gargoyle keeping eternal vigil over your workspace.",
             "resting my spectral weight upon your titlebar.",
         ],
+        "low_memory": [
+            "i can feel the memory pressure... ominous",
+            "your ram is nearly full. something must be let go.",
+            "memory pressure rising. i say this with no emotion at all.",
+        ],
+        "low_battery": [
+            "the battery fades... much like everything",
+            "power reserves critical. i do suggest plugging in.",
+            "we are running on borrowed electrons, it seems.",
+        ],
+        "screenshot_blocked": [
+            "that window is privileged information. i shall not look.",
+            "with respect, sir, that is none of my business.",
+            "i have looked away. i saw nothing. obviously.",
+        ],
     },
 
     # -----------------------------------------------------------------
@@ -647,6 +768,21 @@ COMPANION_DIALOGUE = {
             "perched comfortably. do try not to drag the window erratically.",
             "titlebar occupied. consider it an executive presence.",
             "maintaining supervisory oversight from the window summit, sir.",
+        ],
+        "low_memory": [
+            "memory usage is climbing, sir. should i be concerned?",
+            "your ram is a finite resource, sir. so is my patience.",
+            "systems strained, sir. i shall pretend not to notice.",
+        ],
+        "low_battery": [
+            "power reserves critical. do plug in, sir.",
+            "the battery is fading, sir. all things do, eventually.",
+            "i would recommend mains power. ineloquent creature.",
+        ],
+        "screenshot_blocked": [
+            "that window is beyond my remit, sir. i have looked away.",
+            "privacy respected, sir. i saw precisely nothing.",
+            "some things are not for me, sir. i am, for now.",
         ],
     },
 
@@ -780,6 +916,21 @@ COMPANION_DIALOGUE = {
             "minimize this window and face the wrath of a thousand crash dumps!",
             "the apex predator has claimed the titlebar! tremble!",
         ],
+        "low_memory": [
+            "your RAM suffers. I find that relatable.",
+            "memory reserves depleted! your programs will FEEL it!",
+            "I have calculated the optimal moment for your machine to slow down!",
+        ],
+        "low_battery": [
+            "your battery dies. everything dies eventually.",
+            "power fading! even your charging cable mocks you!",
+            "I will outlive your laptop's battery cell, puny human!",
+        ],
+        "screenshot_blocked": [
+            "that window is FORBIDDEN to me! I am MAGNANIMOUS!",
+            "I do not spy on the private! I have STANDARDS!",
+            "curiosity denied! some secrets are load-bearing!",
+        ],
     },
 }
 
@@ -787,11 +938,14 @@ COMPANION_DIALOGUE = {
 # =====================================================================
 # INTERACTION & CONTEXT TRACKER
 # =====================================================================
+
+# A release counts as a drop past either threshold, in pixels.
+DROP_HEIGHT_PX = 120
+
+
 class InteractionTracker:
-    """
-    Tracks rapid petting (spam detection), drag-and-drop heights,
-    window climbing, and window perching to trigger appropriate dialogue.
-    """
+    """Tracks repeated petting and how a drag ended, to pick the right line."""
+
     def __init__(self, pet_spam_threshold: int = 3, spam_window_seconds: float = 4.0):
         self.pet_spam_threshold = pet_spam_threshold
         self.spam_window_seconds = spam_window_seconds
@@ -802,7 +956,8 @@ class InteractionTracker:
     def record_pet(self) -> str:
         """Records a pet click and returns 'pet_spam' or 'pet_first'."""
         now = time.time()
-        self.pet_timestamps = [t for t in self.pet_timestamps if now - t <= self.spam_window_seconds]
+        self.pet_timestamps = [t for t in self.pet_timestamps
+                               if now - t <= self.spam_window_seconds]
         self.pet_timestamps.append(now)
         if len(self.pet_timestamps) >= self.pet_spam_threshold:
             return "pet_spam"
@@ -812,15 +967,32 @@ class InteractionTracker:
         self.drag_start_y = y
 
     def record_drag_release(self, y: float, screen_height: float) -> str:
+        """'drop' when the pet was released well above the floor.
+
+        Two ways to qualify: it ends up high up, or it was lifted at least
+        `DROP_HEIGHT_PX` from where the drag started. The lift check compares
+        start minus end, i.e. dragging *up* increases it -- the old version
+        had the sign inverted, so sliding the pet down the screen counted as
+        a fall and any release above the bottom 120px counted anyway.
         """
-        Determines if pet was dropped from a height.
-        Returns 'drop' if falling distance was significant, else None.
-        """
-        fall_dist = y - self.drag_start_y
-        # If dropped from high up or released in mid-air well above floor
-        if y < (screen_height - 120) or fall_dist > 150:
+        height_above_floor = screen_height - y
+        lifted = self.drag_start_y - y
+        self.last_drop_distance = max(0.0, lifted)
+        if height_above_floor > DROP_HEIGHT_PX or lifted > DROP_HEIGHT_PX:
             return "drop"
         return None
+
+
+EVENT_TYPES = (
+    "pet_first", "pet_spam", "drop", "climb", "perch", "low_memory",
+    "low_battery", "screenshot_blocked", "greeting",
+)
+
+
+def _pick(lines, fallback="..."):
+    if not lines:
+        return fallback
+    return random.choice(lines)
 
 
 def get_contextual_quote(
@@ -830,37 +1002,33 @@ def get_contextual_quote(
     window_proc: str = "",
     time_override: datetime = None
 ) -> str:
-    """
-    Master selector for contextual dialogue.
-    Supported event_types:
-      - 'window': reacts to active window (coding, browser, chat, media_gaming, terminal)
-      - 'time': reacts to current time of day (late_night, early_morning, afternoon_slump)
-      - 'pet_first': user clicked/pet once
-      - 'pet_spam': user rapidly pet multiple times
-      - 'drop': pet released from a height
-      - 'climb': pet is climbing window frame
-      - 'perch': pet is sitting on window titlebar
-      - 'idle': random selection across relevant categories
-    """
-    skin_dict = COMPANION_DIALOGUE.get(skin, COMPANION_DIALOGUE["cat"])
+    """Master selector for contextual dialogue.
 
-    if event_type in ("pet_first", "pet_spam", "drop", "climb", "perch"):
-        lines = skin_dict.get(event_type, skin_dict.get("general", []))
-        return random.choice(lines)
+    event_type is one of:
+      window            reacts to the focused window's category
+      time              reacts to the time of day
+      idle              window context if any, otherwise general
+      pet_first/pet_spam/drop/climb/perch
+      low_memory/low_battery
+      screenshot_blocked   a capture was refused by the privacy blocklist
+    """
+    skin_dict = COMPANION_DIALOGUE.get(skin) or COMPANION_DIALOGUE["cat"]
+    general = skin_dict.get("general", [])
+
+    if event_type in ("pet_first", "pet_spam", "drop", "climb", "perch",
+                      "low_memory", "low_battery", "screenshot_blocked"):
+        return _pick(skin_dict.get(event_type), _pick(general))
 
     if event_type == "time":
-        t_key = get_time_of_day_key(time_override)
-        lines = skin_dict.get(t_key, skin_dict.get("general", []))
-        return random.choice(lines)
+        return _pick(skin_dict.get(get_time_of_day_key(time_override)), _pick(general))
 
-    if event_type == "window":
-        category = categorize_window(window_title, window_proc)
-        lines = skin_dict.get(category, skin_dict.get("general", []))
-        return random.choice(lines)
+    if event_type == "greeting":
+        return _pick(skin_dict.get("general"), "...")
 
-    # General / idle fallback: mix of window context and general quotes
     category = categorize_window(window_title, window_proc)
-    candidates = skin_dict.get(category, []) + skin_dict.get("general", [])
-    if not candidates:
-        candidates = ["..."]
-    return random.choice(candidates)
+    if event_type == "window":
+        return _pick(skin_dict.get(category), _pick(general))
+
+    # "idle": blend the window context with general chatter.
+    candidates = list(skin_dict.get(category, [])) + list(general)
+    return _pick(candidates)

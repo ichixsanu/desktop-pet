@@ -1,207 +1,202 @@
-import sys
+"""Screen capture with blocklist redaction.
+
+Window enumeration lives in `window_tracker`; this module only grabs pixels.
+Keeping one enumeration implementation matters for privacy, not just tidiness:
+the two copies disagreed about what counts as a window, and the disagreeing
+copy was the one deciding what to black out.
+
+Threading: `QScreen.grabWindow` returns a QPixmap, which is not safe off the
+GUI thread, so `grab_screen_image()` must be called from the Qt main thread.
+Everything after that -- redaction, JPEG encoding, base64 -- is QImage work and
+belongs on a worker, which is where the 100-800ms used to be spent.
+"""
+
 import base64
-import ctypes
+import sys
+from typing import List, Optional, Tuple
 
-from PyQt5.QtCore import Qt, QBuffer, QIODevice
-from PyQt5.QtGui import QPainter, QColor, QPixmap
-
-IS_WIN = sys.platform.startswith("win")
-IS_LINUX = sys.platform.startswith("linux")
+from PyQt5.QtCore import QBuffer, QIODevice, QRect, Qt
+from PyQt5.QtGui import QColor, QImage, QPainter, QPixmap
 
 try:
-    import psutil
-except Exception:
-    psutil = None
-
-_xdisplay = None
+    import window_tracker
+except Exception:  # pragma: no cover - the pet degrades without it
+    window_tracker = None
 
 
-def _proc_name(pid):
-    if not psutil or not pid:
-        return ""
-    try:
-        return psutil.Process(pid).name()
-    except Exception:
-        return ""
+def _tracker():
+    return window_tracker.get_tracker() if window_tracker else None
 
 
-# ---- Windows ----
-def _win_active():
-    try:
-        user32 = ctypes.windll.user32
-        hwnd = user32.GetForegroundWindow()
-        length = user32.GetWindowTextLengthW(hwnd)
-        buf = ctypes.create_unicode_buffer(length + 1)
-        user32.GetWindowTextW(hwnd, buf, length + 1)
-        pid = ctypes.c_ulong()
-        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-        return buf.value, _proc_name(pid.value)
-    except Exception:
-        return None, None
+# =====================================================================
+# Blocklist
+# =====================================================================
 
-
-def _win_list():
-    import ctypes.wintypes as wt
-    out = []
-    try:
-        user32 = ctypes.windll.user32
-        EnumProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_int, ctypes.c_int)
-
-        def cb(hwnd, _lparam):
-            if not user32.IsWindowVisible(hwnd):
-                return True
-            length = user32.GetWindowTextLengthW(hwnd)
-            if length == 0:
-                return True
-            buf = ctypes.create_unicode_buffer(length + 1)
-            user32.GetWindowTextW(hwnd, buf, length + 1)
-            rect = wt.RECT()
-            user32.GetWindowRect(hwnd, ctypes.byref(rect))
-            pid = ctypes.c_ulong()
-            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-            out.append({"title": buf.value, "process": _proc_name(pid.value),
-                        "rect": (rect.left, rect.top, rect.right, rect.bottom)})
-            return True
-
-        user32.EnumWindows(EnumProc(cb), 0)
-    except Exception:
-        return []
-    return out
-
-
-# ---- Linux / X11 (best effort -- unavailable under pure Wayland) ----
-def _get_xlib():
-    global _xdisplay
-    if _xdisplay is not None:
-        return _xdisplay
-    try:
-        from Xlib import display
-        _xdisplay = display.Display()
-    except Exception:
-        _xdisplay = False
-    return _xdisplay or None
-
-
-def _linux_active():
-    d = _get_xlib()
-    if not d:
-        return None, None
-    try:
-        root = d.screen().root
-        active_atom = d.intern_atom("_NET_ACTIVE_WINDOW")
-        prop = root.get_full_property(active_atom, 0)
-        if not prop or not prop.value:
-            return None, None
-        window = d.create_resource_object("window", prop.value[0])
-        name = window.get_wm_name()
-        pid_atom = d.intern_atom("_NET_WM_PID")
-        pid_prop = window.get_full_property(pid_atom, 0)
-        pid = pid_prop.value[0] if pid_prop else None
-        return name, _proc_name(pid)
-    except Exception:
-        return None, None
-
-
-def _linux_list():
-    d = _get_xlib()
-    if not d:
-        return []
-    out = []
-    try:
-        root = d.screen().root
-        list_atom = d.intern_atom("_NET_CLIENT_LIST")
-        prop = root.get_full_property(list_atom, 0)
-        if not prop:
-            return []
-        for w_id in prop.value:
-            try:
-                window = d.create_resource_object("window", w_id)
-                name = window.get_wm_name() or ""
-                geom = window.get_geometry()
-                abs_pos = root.translate_coords(window, 0, 0)
-                if not abs_pos:
-                    continue
-                x, y = abs_pos.x, abs_pos.y
-                pid_atom = d.intern_atom("_NET_WM_PID")
-                pid_prop = window.get_full_property(pid_atom, 0)
-                pid = pid_prop.value[0] if pid_prop else None
-                out.append({"title": name, "process": _proc_name(pid),
-                            "rect": (x, y, x + geom.width, y + geom.height)})
-            except Exception:
-                continue
-    except Exception:
-        return []
-    return out
-
-
-def get_active_window_info():
-    if IS_WIN:
-        return _win_active()
-    if IS_LINUX:
-        return _linux_active()
-    return None, None
-
-
-def list_windows():
-    if IS_WIN:
-        return _win_list()
-    if IS_LINUX:
-        return _linux_list()
-    return []
-
-
-def window_detection_available():
-    if IS_WIN:
-        return True
-    if IS_LINUX:
-        return _get_xlib() is not None
-    return False
-
-
-def _is_blocked(title, process, blocklist):
+def is_blocked(title: str, process: str, blocklist) -> bool:
+    """Case-insensitive substring match on window title and process name."""
     title = (title or "").lower()
     process = (process or "").lower()
-    for entry in blocklist:
-        e = (entry or "").strip().lower()
-        if e and (e in title or e in process):
+    for entry in blocklist or []:
+        needle = (entry or "").strip().lower()
+        if needle and (needle in title or needle in process):
             return True
     return False
 
 
-def capture_with_redaction(app, blocklist, jpeg_quality=70):
-    blocklist = blocklist or []
-    active_title, active_proc = get_active_window_info()
-    if blocklist and not window_detection_available():
-        return None
-    if _is_blocked(active_title, active_proc, blocklist):
-        return None
+def blocked_windows(blocklist) -> List:
+    """Every currently-known window that matches the blocklist."""
+    tracker = _tracker()
+    if not tracker or not blocklist:
+        return []
+    return [w for w in tracker.get_windows()
+            if is_blocked(w.title, w.process, blocklist)]
 
-    screen = app.primaryScreen()
+
+def redaction_guarantee(blocklist) -> Tuple[bool, str]:
+    """(safe_to_capture, reason).
+
+    A blocklist is a promise that blocked windows never leave the machine. That
+    promise can only be kept if we can actually see every window, so anything
+    less than a complete view -- no window API at all, or Wayland with its
+    deliberate refusal to enumerate other clients -- means capture is refused.
+    """
+    if not blocklist:
+        return True, ""
+    if window_tracker is None:
+        return False, "window detection module unavailable"
+    if not window_tracker.window_detection_available():
+        return False, "no window API available (Wayland, headless, or unsupported)"
+    if not window_tracker.detection_is_complete():
+        return False, ("Wayland session: other applications' windows cannot be "
+                       "enumerated, so blocked windows cannot be redacted")
+    return True, ""
+
+
+# =====================================================================
+# Capture
+# =====================================================================
+
+def _target_screen(app, screen_rect=None):
+    """The screen to grab: the one the pet is on, else the primary one."""
+    if not app:
+        return None
+    try:
+        screens = app.screens()
+    except Exception:
+        screens = []
+    if not screens:
+        return app.primaryScreen()
+    if screen_rect:
+        left, top, right, bottom = screen_rect
+        center_x = (left + right) // 2
+        center_y = (top + bottom) // 2
+        for screen in screens:
+            if screen.geometry().contains(center_x, center_y):
+                return screen
+    return app.primaryScreen()
+
+
+def grab_screen_image(app, screen_rect=None) -> Optional[QImage]:
+    """Grab the screen as a QImage. GUI THREAD ONLY (QPixmap under the hood)."""
+    screen = _target_screen(app, screen_rect)
     if screen is None:
         return None
-    pixmap = screen.grabWindow(0)
+    try:
+        pixmap: QPixmap = screen.grabWindow(0)
+    except Exception:
+        return None
     if pixmap is None or pixmap.isNull():
         return None
+    try:
+        return pixmap.toImage()
+    except Exception:
+        return None
 
-    if blocklist:
-        hits = [w for w in list_windows() if _is_blocked(w.get("title"), w.get("process"), blocklist)]
-        if hits:
-            image = pixmap.toImage()
-            painter = QPainter(image)
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(QColor(0, 0, 0))
-            for w in hits:
-                x0, y0, x1, y1 = w["rect"]
-                if x1 > x0 and y1 > y0:
-                    painter.drawRect(int(x0), int(y0), int(x1 - x0), int(y1 - y0))
-            painter.end()
-            pixmap = QPixmap.fromImage(image)
 
-    buf = QBuffer()
-    buf.open(QIODevice.WriteOnly)
-    pixmap.save(buf, "JPEG", jpeg_quality)
-    data = bytes(buf.data())
-    buf.close()
+def redact(image: QImage, blocklist, screen_rect=None) -> QImage:
+    """Black out every blocked window. Safe on any thread.
+
+    Window rects are in desktop coordinates while the image starts at the
+    grabbed screen's origin, so they are translated before drawing: without
+    this, a second monitor to the left of the primary shifted every redaction
+    by the monitor's width and could leave a blocked window unblacked.
+    """
+    if image is None or image.isNull() or not blocklist:
+        return image
+
+    origin_x, origin_y = 0, 0
+    if screen_rect:
+        origin_x, origin_y = int(screen_rect[0]), int(screen_rect[1])
+
+    targets = blocked_windows(blocklist)
+    if not targets:
+        return image
+
+    painter = QPainter(image)
+    try:
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(0, 0, 0))
+        for win in targets:
+            rect = QRect(win.left - origin_x, win.top - origin_y,
+                         win.width, win.height).intersected(image.rect())
+            if rect.width() > 0 and rect.height() > 0:
+                painter.fillRect(rect, QColor(0, 0, 0))
+    finally:
+        painter.end()
+    return image
+
+
+def encode_jpeg_base64(image: QImage, jpeg_quality: int = 70) -> Optional[str]:
+    """Encode a QImage to base64 JPEG. Safe on any thread."""
+    if image is None or image.isNull():
+        return None
+    buffer = QBuffer()
+    buffer.open(QIODevice.WriteOnly)
+    try:
+        if not image.save(buffer, "JPEG", int(jpeg_quality)):
+            return None
+        data = bytes(buffer.data())
+    finally:
+        buffer.close()
     if not data:
         return None
     return base64.b64encode(data).decode("ascii")
+
+
+def capture_with_redaction(app, blocklist, jpeg_quality=70, screen_rect=None):
+    """Synchronous capture, redacted and encoded. Blocks the caller.
+
+    Kept for tests and one-off use; the pet uses grab_screen_image() on the
+    GUI thread and then encode off it.
+    """
+    blocklist = blocklist or []
+    safe, reason = redaction_guarantee(blocklist)
+    if not safe:
+        return None
+
+    image = grab_screen_image(app, screen_rect)
+    if image is None:
+        return None
+    redact(image, blocklist, screen_rect)
+    return encode_jpeg_base64(image, jpeg_quality)
+
+
+def prepare_capture(app, blocklist, screen_rect=None):
+    """(image, reason).
+
+    GUI thread: checks the foreground window against the blocklist and grabs
+    the pixels. Returns (None, reason) instead of capturing when the view of
+    the desktop is not provably complete or the focused window is blocked.
+    """
+    blocklist = blocklist or []
+    safe, reason = redaction_guarantee(blocklist)
+    if not safe:
+        return None, reason
+
+    tracker = _tracker()
+    if tracker and blocklist:
+        active = tracker.get_active_window()
+        if active and is_blocked(active.title, active.process, blocklist):
+            return None, "focused window matches the blocklist"
+
+    return grab_screen_image(app, screen_rect), ""
