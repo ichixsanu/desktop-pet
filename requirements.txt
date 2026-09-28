@@ -1,0 +1,4 @@
+PyQt5
+groq
+psutil
+python-xlib ; sys_platform == "linux"
