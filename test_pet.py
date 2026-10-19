@@ -7,6 +7,7 @@ through the timer so the tests are deterministic.
 """
 
 import os
+import time
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -33,6 +34,24 @@ def setUpModule():
 
 def make_font():
     return QFont("DejaVu Sans Mono", P.SPEECH_FONT_SIZE)
+
+
+def _find_action(menu, text):
+    """Find an action by label, looking inside submenus too.
+
+    The menu gained a Screenshots & Privacy submenu, so the old flat scan for
+    "Look At This" stopped finding it. Walking the tree keeps the tests honest
+    about the real layout.
+    """
+    for action in menu.actions():
+        if action.text() == text:
+            return action
+        submenu = action.menu()
+        if submenu is not None:
+            found = _find_action(submenu, text)
+            if found is not None:
+                return found
+    return None
 
 
 class TestTextWrapping(unittest.TestCase):
@@ -194,6 +213,20 @@ class PetHarness(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
+        # Idle chatter must never reach the network from a test. Tests that are
+        # about the model path patch these explicitly.
+        for name, value in (("maybe_context_line", False), ("maybe_idle_line", None)):
+            ctx = patch.object(ai_companion, name, return_value=value)
+            ctx.start()
+            self.addCleanup(ctx.stop)
+
+        # Pin the environment signals the pet reads from the OS: a machine that
+        # happens to be idle (or showing a fullscreen window) while the tests
+        # run must not change what the FSM does.
+        idle = patch.object(P.DesktopPet, "_user_idle_seconds", return_value=0.0)
+        idle.start()
+        self.addCleanup(idle.stop)
+
         self.pet = P.DesktopPet(skin="cat", scale=2)
         self.pet.timer.stop()
         self.apply_screen()
@@ -201,6 +234,10 @@ class PetHarness(unittest.TestCase):
                                             return_value=(list(self.WINDOWS), None))
         self.tracker_patcher.start()
         self.addCleanup(self.tracker_patcher.stop)
+        fullscreen = patch.object(self.pet.tracker, "fullscreen_active",
+                                  return_value=False)
+        fullscreen.start()
+        self.addCleanup(fullscreen.stop)
         self.addCleanup(self.pet.shutdown)
         self.refresh()
 
@@ -519,9 +556,18 @@ class TestSpeechAndActivity(PetHarness):
             self.pet._on_ai_line("a model line", ai_companion.STATUS_OK)
             speak.assert_called_once_with("a model line")
 
+        # A skipped *background* request stays silent...
+        self.pet.ai_request_kind = "idle"
         with patch.object(self.pet, "speak") as speak:
             self.pet._on_ai_line(None, ai_companion.STATUS_SKIPPED)
             speak.assert_not_called()
+
+        # ...but a skipped request the user made themselves gets the canned
+        # line, because a menu item that does nothing reads as broken.
+        self.pet.ai_request_kind = "user"
+        with patch.object(self.pet, "speak") as speak:
+            self.pet._on_ai_line(None, ai_companion.STATUS_SKIPPED)
+            speak.assert_called_once()
 
         with patch.object(self.pet, "speak") as speak:
             self.pet._on_ai_line(None, ai_companion.STATUS_UNAVAILABLE)
@@ -615,18 +661,60 @@ class TestScreenshotWiring(PetHarness):
                             self.pet.maybe_screenshot()
         self.assertIn("target", captured, "capture did not go to a worker")
         self.assertTrue(captured["daemon"])
-        # Running the worker body must redact, encode, then ask the model.
+        # Running the worker body must redact, filter, encode, then ask.
         with patch("pet.screen_capture.redact") as redact:
-            with patch("pet.screen_capture.encode_jpeg_base64",
-                       return_value="b64") as encode:
-                with patch("pet.ai_companion.request_screenshot_comment") as ask:
-                    with patch("pet.ai_companion.record_capture_attempt") as record:
-                        captured["target"]()
+            with patch("pet.screen_capture.scan_capture",
+                       return_value=(True, "")) as scan:
+                with patch("pet.screen_capture.encode_jpeg_base64",
+                           return_value="b64") as encode:
+                    with patch("pet.ai_companion.request_screenshot_comment") as ask:
+                        with patch("pet.ai_companion.record_capture_attempt") as record:
+                            captured["target"]()
         redact.assert_called_once()
+        scan.assert_called_once()
         encode.assert_called_once()
         ask.assert_called_once()
         record.assert_called_once_with(True)
         self.assertFalse(self.pet._screenshot_inflight)
+
+    def test_sensitive_capture_is_discarded_not_sent(self):
+        """The OCR filter runs after redaction and before anything is sent."""
+        captured, thread_cls = self._worker_kwargs()
+        with patch("pet.ai_companion.screenshot_settings", return_value=self.settings):
+            with patch("pet.ai_companion.screenshot_slot_ok", return_value=True):
+                with patch("pet.screen_capture.prepare_capture",
+                           return_value=(MagicMock(), "")):
+                    with patch("pet.threading.Thread", thread_cls):
+                        self.pet.maybe_screenshot()
+        with patch("pet.screen_capture.redact"):
+            with patch("pet.screen_capture.scan_capture",
+                       return_value=(False, "sensitive text on screen (card number)")):
+                with patch("pet.screen_capture.encode_jpeg_base64") as encode:
+                    with patch("pet.ai_companion.request_screenshot_comment") as ask:
+                        with patch("pet.ai_companion.record_capture_attempt") as record:
+                            with patch("pet.ai_companion.note_capture_decision") as note:
+                                captured["target"]()
+        encode.assert_not_called()
+        ask.assert_not_called()
+        record.assert_called_once_with(False)
+        self.assertFalse(self.pet._screenshot_inflight)
+        self.assertTrue(any(call.args[0] == "discarded" for call in note.call_args_list))
+
+    def test_manual_capture_respects_the_daily_cap(self):
+        # reserve_forced_screenshot()'s result used to be thrown away, so a
+        # user-initiated capture ignored the daily cap completely.
+        with patch("pet.ai_companion.screenshot_settings", return_value=self.settings):
+            with patch("pet.ai_companion.ai_enabled", return_value=True):
+                with patch("pet.ai_companion.reserve_forced_screenshot",
+                           return_value=False) as reserve:
+                    with patch("pet.screen_capture.prepare_capture") as prepare:
+                        with patch("pet.threading.Thread") as thread:
+                            with patch("pet.ai_companion.note_capture_decision") as note:
+                                self.pet.maybe_screenshot(force=True)
+        reserve.assert_called_once()
+        prepare.assert_not_called()
+        thread.assert_not_called()
+        self.assertTrue(any(call.args[0] == "refused" for call in note.call_args_list))
 
     def test_encode_failure_is_reported_and_clears_the_flag(self):
         captured, thread_cls = self._worker_kwargs()
@@ -1350,6 +1438,42 @@ class TestManualCapture(PetHarness):
                         self.pet.maybe_screenshot(force=True)
         self.assertTrue(self.pet.isVisible())
 
+    def test_the_pet_comes_back_on_top_after_a_capture(self):
+        # The bug this whole flag-dance exists for: show() after hide() hands
+        # the window manager a new mapping and the pet came back *behind* the
+        # window it had been covering.
+        from PyQt5.QtCore import Qt as QtFlags
+
+        self.pet.show()
+        with patch("pet.screen_capture.prepare_capture") as prepare:
+            prepare.return_value = (MagicMock(), "")
+            with patch("pet.ai_companion.ai_enabled", return_value=True):
+                with patch("pet.ai_companion.reserve_forced_screenshot"):
+                    with patch("pet.threading.Thread"):
+                        self.pet.maybe_screenshot(force=True)
+        prepare.assert_called_once()
+        self.assertTrue(bool(self.pet.windowFlags() & QtFlags.WindowStaysOnTopHint),
+                        "the pet is no longer always-on-top after a capture")
+        self.assertTrue(self.pet.isVisible())
+
+    def test_the_flags_survive_click_through_too(self):
+        from PyQt5.QtCore import Qt as QtFlags
+
+        self.pet.click_through = True
+        self.pet._restack_on_top()
+        flags = self.pet.windowFlags()
+        self.assertTrue(bool(flags & QtFlags.WindowStaysOnTopHint))
+        self.assertTrue(bool(flags & QtFlags.WindowTransparentForInput))
+
+    def test_a_capture_while_hidden_stays_hidden(self):
+        # Hidden for a fullscreen window: the capture must not drag the pet
+        # back onto the film.
+        self.pet.hide()
+        self.pet._hidden_for_fullscreen = True
+        self.pet._capture_was_visible = False
+        self.pet._show_after_capture()
+        self.assertFalse(self.pet.isVisible())
+
     def test_menu_defers_the_capture_until_it_closes(self):
         # Capturing from inside the menu action would put the pet's own menu in
         # the screenshot.
@@ -1360,9 +1484,9 @@ class TestManualCapture(PetHarness):
         pet.show()
 
         def exec_and_trigger(menu, _pos=None):
-            for action in menu.actions():
-                if action.text() == "Look At This":
-                    action.trigger()
+            action = _find_action(menu, "Look At This")
+            if action is not None:
+                action.trigger()
             return None
 
         timers = []
@@ -1504,6 +1628,440 @@ class TestLongRunInvariants(PetHarness):
             self.assertLessEqual(self.pet.energy, 100.0)
         # A run this long should have exercised more than sitting still.
         self.assertGreaterEqual(len(states), 4, "only saw %s" % sorted(states))
+
+
+class TestStaleLedgeOutsidePerch(PetHarness):
+    """A window that closes under the pet must not leave it in mid-air.
+
+    The validation used to run from PERCH only, so a pet that had settled into
+    SIT/WALK/SLEEP on a titlebar kept standing at the height of a window that
+    no longer existed.
+    """
+
+    def perch_on_window_a(self):
+        self.assertEqual(self.land(200, 50), "PERCH")   # Window A, titlebar y=200
+        ledge = self.pet.current_ledge
+        self.assertIsNotNone(ledge)
+        return ledge
+
+    def vanish_the_windows(self):
+        with patch.object(self.pet.tracker, "_query_os_windows",
+                          return_value=([], None)):
+            self.refresh()
+
+    def test_sitting_pet_falls_when_its_window_closes(self):
+        ledge = self.perch_on_window_a()
+        self.pet._enter_state("SIT")
+        self.vanish_the_windows()
+        self.pet._update_fsm(QPoint(5, 5))
+        self.assertEqual(self.pet.state, "FALL")
+        self.assertIsNone(self.pet.current_ledge)
+        self.assertLess(self.pet.y_pos, ledge.y)
+
+    def test_walking_pet_falls_when_its_window_closes(self):
+        self.perch_on_window_a()
+        self.pet._enter_state("WALK")
+        self.vanish_the_windows()
+        self.pet._update_fsm(QPoint(5, 5))
+        self.assertEqual(self.pet.state, "FALL")
+
+    def test_sleeping_pet_falls_when_its_window_closes(self):
+        self.perch_on_window_a()
+        self.pet._enter_state("SLEEP")
+        self.vanish_the_windows()
+        self.pet._update_fsm(QPoint(5, 5))
+        self.assertEqual(self.pet.state, "FALL")
+
+    def test_a_window_that_moves_out_from_under_the_pet_drops_it(self):
+        # Ledge identity is (y, x range): a titlebar that moves is a different
+        # ledge, so the pet loses its footing and falls -- onto the new spot
+        # when it is below, exactly like a real perch being yanked sideways.
+        self.perch_on_window_a()
+        moved = [wt.WindowInfo(id=1, title="Window A", rect=(100, 300, 500, 600)),
+                 wt.WindowInfo(id=2, title="Window B", rect=(400, 400, 900, 750))]
+        with patch.object(self.pet.tracker, "_query_os_windows",
+                          return_value=(moved, None)):
+            self.refresh()
+            self.pet._enter_state("SIT")
+            self.pet._update_fsm(QPoint(5, 5))
+            self.assertEqual(self.pet.state, "FALL")
+            for _ in range(200):
+                self.pet._update_fsm(QPoint(5, 5))
+                if self.pet.state != "FALL":
+                    break
+        ledge = self.pet.current_ledge
+        self.assertIsNotNone(ledge)
+        self.assertEqual(ledge.y, 300)
+        self.assertAlmostEqual(self.pet.y_pos, ledge.y - self.pet.sprite_h, delta=1.5)
+
+    def test_a_still_window_keeps_the_pet_seated(self):
+        ledge = self.perch_on_window_a()
+        self.pet._enter_state("SIT")
+        self.pet._update_fsm(QPoint(5, 5))
+        self.assertIsNotNone(self.pet.current_ledge)
+        self.assertAlmostEqual(self.pet.y_pos, ledge.y - self.pet.sprite_h, delta=1.0)
+
+    def test_a_pet_on_the_floor_is_left_alone(self):
+        self.pet._enter_state("SIT")
+        ledge = self.pet.current_ledge
+        self.assertIsNone(ledge)
+        self.pet._update_fsm(QPoint(5, 5))
+        self.assertIn(self.pet.state, ("SIT", "IDLE"))
+        self.assertAlmostEqual(self.pet.y_pos, self.pet.floor_y, delta=1.0)
+
+
+class TestQuietHours(PetHarness):
+    def set_quiet(self, enabled=True, start="23:00", end="07:00"):
+        behaviour = self.pet._behaviour()
+        behaviour["quiet_hours"] = {"enabled": enabled, "start": start, "end": end}
+
+    def test_parsing(self):
+        self.assertEqual(P._parse_clock("23:30"), 1410)
+        self.assertEqual(P._parse_clock("00:05"), 5)
+        self.assertIsNone(P._parse_clock("not a time"))
+        self.assertIsNone(P._parse_clock(None))
+
+    def test_wraps_midnight(self):
+        self.set_quiet(start="23:00", end="07:00")
+        with patch("pet.time.localtime",
+                   return_value=time.struct_time((2026, 1, 1, 2, 0, 0, 3, 1, 0))):
+            self.assertTrue(self.pet._quiet_now())
+        with patch("pet.time.localtime",
+                   return_value=time.struct_time((2026, 1, 1, 12, 0, 0, 3, 1, 0))):
+            self.assertFalse(self.pet._quiet_now())
+
+    def test_plain_window(self):
+        self.set_quiet(start="09:00", end="17:00")
+        with patch("pet.time.localtime",
+                   return_value=time.struct_time((2026, 1, 1, 10, 0, 0, 3, 1, 0))):
+            self.assertTrue(self.pet._quiet_now())
+        with patch("pet.time.localtime",
+                   return_value=time.struct_time((2026, 1, 1, 20, 0, 0, 3, 1, 0))):
+            self.assertFalse(self.pet._quiet_now())
+
+    def test_disabled_or_broken_config_is_never_quiet(self):
+        self.set_quiet(enabled=False)
+        self.assertFalse(self.pet._quiet_now())
+        self.set_quiet(start="garbage")
+        self.assertFalse(self.pet._quiet_now())
+
+    def test_quiet_hours_silence_the_context_chatter(self):
+        self.set_quiet()
+        self.pet.speech_timer = 0
+        with patch.object(self.pet, "speak") as speak:
+            with patch("pet.time.localtime",
+                       return_value=time.struct_time((2026, 1, 1, 23, 30, 0, 3, 1, 0))):
+                self.pet._check_window_context()
+        speak.assert_not_called()
+
+    def test_a_quiet_hour_nap_still_lets_the_user_speak(self):
+        import ai_companion
+
+        self.set_quiet()
+        with patch.object(ai_companion, "ai_enabled", return_value=False):
+            with patch.object(self.pet, "speak") as speak:
+                self.pet.request_dialogue(user_initiated=True)
+        self.assertTrue(speak.called, "an explicit request must always answer")
+
+    def test_a_throttled_user_request_falls_back_to_a_canned_line(self):
+        # maybe_idle_line reports SKIPPED synchronously when the pool is full;
+        # the menu item must still say something.
+        import ai_companion
+
+        def fake_idle_line(skin, on_done, kind="idle"):
+            on_done(None, ai_companion.STATUS_SKIPPED)
+
+        with patch.object(ai_companion, "maybe_idle_line", side_effect=fake_idle_line):
+            with patch.object(ai_companion, "ai_enabled", return_value=True):
+                with patch.object(self.pet, "speak") as speak:
+                    self.pet.request_dialogue(user_initiated=True)
+        self.assertTrue(speak.called)
+
+
+class TestIdleNap(PetHarness):
+    def test_naps_after_the_configured_idle_time(self):
+        self.pet._enter_state("SIT")
+        with patch.object(self.pet, "_user_idle_seconds", return_value=400.0):
+            self.pet._update_fsm(QPoint(5, 5))
+        self.assertEqual(self.pet.state, "SLEEP")
+
+    def test_stays_awake_before_it(self):
+        self.pet._enter_state("SIT")
+        with patch.object(self.pet, "_user_idle_seconds", return_value=5.0):
+            self.pet._update_fsm(QPoint(5, 5))
+        self.assertNotEqual(self.pet.state, "SLEEP")
+
+    def test_disabled_with_zero(self):
+        self.pet._behaviour()["sleep_when_idle_seconds"] = 0
+        self.pet._enter_state("SIT")
+        with patch.object(self.pet, "_user_idle_seconds", return_value=99999.0):
+            self.pet._update_fsm(QPoint(5, 5))
+        self.assertNotEqual(self.pet.state, "SLEEP")
+
+    def test_never_naps_in_the_middle_of_the_air(self):
+        self.pet.y_pos = 0.0
+        self.pet._enter_fall()
+        with patch.object(self.pet, "_user_idle_seconds", return_value=99999.0):
+            self.pet._update_fsm(QPoint(5, 5))
+        self.assertEqual(self.pet.state, "FALL")
+
+    def test_an_idle_pet_stays_asleep_past_its_timer(self):
+        self.pet._enter_state("SLEEP")
+        self.pet.state_timer = P.STATE_MAX_DURATION.get("SLEEP", 300) + 50
+        with patch.object(self.pet, "_user_idle_seconds", return_value=9999.0):
+            self.pet._update_fsm(QPoint(500, 500))
+        self.assertEqual(self.pet.state, "SLEEP", "woke up while nobody was there")
+
+    def test_waking_when_the_user_comes_back(self):
+        self.pet._enter_state("SLEEP")
+        self.pet.state_timer = P.STATE_MAX_DURATION.get("SLEEP", 300) + 50
+        with patch.object(self.pet, "_user_idle_seconds", return_value=1.0):
+            self.pet._update_fsm(QPoint(500, 500))
+        self.assertNotEqual(self.pet.state, "SLEEP")
+
+
+class TestLateReplyHandling(PetHarness):
+    def test_a_late_reply_does_not_overwrite_newer_speech(self):
+        import ai_companion
+
+        self.pet.awaiting_ai = True
+        self.pet.ai_deadline = self.pet.tick_count - 1
+        self.pet.ai_request_kind = "idle"
+        self.pet.speech_timer = 0
+        with patch.object(self.pet, "speak") as speak:
+            self.pet.game_loop()          # deadline missed: canned line
+        self.assertTrue(speak.called)
+        # The user (or another event) says something else; the model reply
+        # arrives afterwards and must not replace it mid-sentence.
+        self.pet.speak("something newer")
+        with patch.object(self.pet, "speak") as speak:
+            self.pet._on_ai_line("the late model line", ai_companion.STATUS_OK)
+        speak.assert_not_called()
+
+    def test_a_late_reply_is_still_used_when_the_bubble_is_empty(self):
+        import ai_companion
+
+        self.pet.awaiting_ai = True
+        self.pet.ai_deadline = self.pet.tick_count - 1
+        self.pet.speech_timer = 0
+        with patch.object(self.pet, "speak") as first:
+            self.pet.game_loop()
+        self.pet.speech_timer = 0
+        self.pet.speech_text = None
+        with patch.object(self.pet, "speak") as speak:
+            self.pet._on_ai_line("the late model line", ai_companion.STATUS_OK)
+        speak.assert_called_once_with("the late model line")
+
+
+class TestMenuToggles(PetHarness):
+    def setUp(self):
+        super().setUp()
+        import pet_state
+        import tempfile
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.state_path = os.path.join(self.tmp.name, "state.json")
+
+    def make_state_store(self):
+        import pet_state
+
+        return pet_state.PetState(path=self.state_path)
+
+    def hidden_state(self):
+        store = self.make_state_store()
+        store.load()
+        return store.data
+
+    def test_movement_toggles_persist(self):
+        store = self.make_state_store()
+        self.pet.state_store = store
+        self.pet._set_movement_flag("allow_jump", False)
+        self.pet._set_movement_flag("allow_chase", False)
+        self.assertFalse(self.pet.allow_jump)
+        self.assertFalse(self.pet.allow_chase)
+        saved = self.hidden_state()
+        self.assertFalse(saved["allow_jump"])
+        self.assertFalse(saved["allow_chase"])
+
+    def test_climb_toggle_persists(self):
+        self.pet.state_store = self.make_state_store()
+        self.pet._set_climb(False)
+        self.assertFalse(self.pet.climb_enabled)
+        self.assertFalse(self.hidden_state()["climb_enabled"])
+
+    def test_click_through_persists_and_sets_the_flag(self):
+        self.pet.state_store = self.make_state_store()
+        self.pet._set_click_through(True)
+        self.assertTrue(self.pet.click_through)
+        self.assertTrue(bool(self.pet.windowFlags() & Qt.WindowTransparentForInput))
+        self.assertTrue(self.hidden_state()["click_through"])
+        self.pet._set_click_through(False)
+        self.assertFalse(bool(self.pet.windowFlags() & Qt.WindowTransparentForInput))
+
+    def test_treat_feeds_and_counts(self):
+        self.pet.state_store = self.make_state_store()
+        self.pet.energy = 40.0
+        with patch.object(self.pet, "_speak_contextual") as speak:
+            self.pet._menu_treat()
+        self.assertEqual(self.pet.energy, 65.0)
+        self.assertTrue(speak.called)
+        self.assertEqual(self.hidden_state()["treats_given"], 1)
+        # Spamming the menu must not be a free energy tap.
+        with patch.object(self.pet, "_speak_contextual"):
+            self.pet._menu_treat()
+        self.assertEqual(self.pet.energy, 65.0)
+
+    def test_stats_line_mentions_the_counters(self):
+        self.pet.state_store = self.make_state_store()
+        text = self.pet._stats_text()
+        self.assertIn("alive", text)
+        self.assertIn("treats", text)
+
+
+class TestPrivacyMenu(PetHarness):
+    def test_menu_exposes_the_privacy_controls(self):
+        menu = self.pet._build_menu()
+        for label in ("Screenshots && Privacy", "Look At This",
+                      "Never Capture This App", "Edit Blocklist...",
+                      "OCR Content Filter", "What Happened To My Screens..."):
+            self.assertIsNotNone(_find_action(menu, label),
+                                 "menu is missing %r" % label)
+
+    def test_the_tray_menu_is_rebuilt_from_live_state(self):
+        from PyQt5.QtWidgets import QMenu
+
+        menu = QMenu()
+        self.pet.tray_menu = menu
+        self.pet._repopulate_tray_menu()
+        self.assertIsNotNone(_find_action(menu, "Speak"))
+        # A rebuild must replace the old contents, not pile up duplicates.
+        second = self.pet._build_menu(menu)
+        self.assertIs(second, menu)
+        labels = [a.text() for a in menu.actions() if a.text()]
+        self.assertEqual(len(labels), len(set(labels)))
+
+    def test_screenshot_toggle_writes_the_config(self):
+        import ai_companion
+
+        with patch.object(ai_companion, "save_config", return_value=True) as save:
+            self.pet._set_screenshots_enabled(True)
+            self.assertTrue(ai_companion.CONFIG["screenshots"]["enabled"])
+            self.pet._set_screenshots_enabled(False)
+            self.assertFalse(ai_companion.CONFIG["screenshots"]["enabled"])
+        self.assertEqual(save.call_count, 2)
+
+    def test_ocr_toggle_writes_the_config(self):
+        import ai_companion
+
+        with patch.object(ai_companion, "save_config", return_value=True):
+            self.pet._set_ocr_enabled(False)
+            self.assertFalse(ai_companion.ocr_settings()["enabled"])
+            self.pet._set_ocr_enabled(True)
+            self.assertTrue(ai_companion.ocr_settings()["enabled"])
+
+    def test_block_current_app_adds_a_process_rule(self):
+        import ai_companion
+
+        window = wt.WindowInfo(id=9, title="Vault", rect=(0, 0, 100, 100),
+                               process="keepassxc", pid=123)
+        with patch.object(self.pet, "_focused_window", return_value=window):
+            with patch.object(ai_companion, "save_config", return_value=True):
+                with patch.object(self.pet, "speak") as speak:
+                    self.pet._menu_block_current_app()
+        self.assertIn("proc:keepassxc", ai_companion.blocklist())
+        self.assertTrue(speak.called)
+
+    def test_block_current_app_falls_back_to_a_title_rule(self):
+        import ai_companion
+
+        window = wt.WindowInfo(id=9, title="Vault", rect=(0, 0, 100, 100),
+                               process="", pid=0)
+        with patch.object(self.pet, "_focused_window", return_value=window):
+            with patch.object(ai_companion, "save_config", return_value=True):
+                with patch.object(self.pet, "speak"):
+                    self.pet._menu_block_current_app()
+        self.assertIn("title:Vault", ai_companion.blocklist())
+
+    def test_blocking_with_nothing_focused_says_so(self):
+        with patch.object(self.pet, "_focused_window", return_value=None):
+            with patch.object(self.pet, "speak") as speak:
+                self.pet._menu_block_current_app()
+        self.assertTrue(speak.called)
+
+
+class TestFullscreenHide(PetHarness):
+    def test_hides_for_a_fullscreen_window(self):
+        with patch.object(self.pet.tracker, "fullscreen_active", return_value=True):
+            self.pet.show()
+            self.pet._check_fullscreen()
+        self.assertTrue(self.pet._hidden_for_fullscreen)
+        self.assertFalse(self.pet.isVisible())
+
+    def test_comes_back_when_it_ends(self):
+        with patch.object(self.pet.tracker, "fullscreen_active", return_value=True):
+            self.pet.show()
+            self.pet._check_fullscreen()
+        with patch.object(self.pet.tracker, "fullscreen_active", return_value=False):
+            self.pet._check_fullscreen()
+        self.assertFalse(self.pet._hidden_for_fullscreen)
+        self.assertTrue(self.pet.isVisible())
+
+    def test_can_be_switched_off(self):
+        self.pet._behaviour()["hide_on_fullscreen"] = False
+        with patch.object(self.pet.tracker, "fullscreen_active", return_value=True):
+            self.pet.show()
+            self.pet._check_fullscreen()
+        self.assertFalse(self.pet._hidden_for_fullscreen)
+        self.assertTrue(self.pet.isVisible())
+
+    def test_no_capture_while_hidden(self):
+        with patch("pet.screen_capture.prepare_capture") as prepare:
+            self.pet._hidden_for_fullscreen = True
+            self.pet.maybe_screenshot(force=True)
+        prepare.assert_not_called()
+
+
+class TestScreenGeometry(PetHarness):
+    def test_virtual_desktop_covers_every_screen(self):
+        from PyQt5.QtCore import QRect
+
+        class FakeScreen:
+            def __init__(self, rect):
+                self._rect = QRect(*rect)
+
+            def geometry(self):
+                return self._rect
+
+        screens = [FakeScreen((-1920, 0, 1920, 1080)),
+                   FakeScreen((0, 0, 1280, 720))]
+        with patch.object(QApplication, "screens", return_value=screens):
+            rect = self.pet._virtual_desktop_rect()
+        self.assertEqual(rect, (-1920, 0, 1280, 1080))
+
+    def test_dragging_onto_a_monitor_left_of_primary_is_allowed(self):
+        from PyQt5.QtCore import QRect
+
+        class FakeScreen:
+            def __init__(self, rect):
+                self._rect = QRect(*rect)
+
+            def geometry(self):
+                return self._rect
+
+        screens = [FakeScreen((-1920, 0, 1920, 1080)),
+                   FakeScreen((0, 0, 1280, 720))]
+        event = MagicMock(buttons=lambda: Qt.LeftButton,
+                          globalPos=lambda: QPoint(-1000, 400))
+        with patch.object(QApplication, "screens", return_value=screens):
+            self.pet.drag_offset = QPoint(0, 0)
+            self.pet.mouseMoveEvent(event)
+        self.assertLess(self.pet.x_pos, 0)
+        self.assertGreaterEqual(self.pet.x_pos, -1920)
+
+    def test_no_screens_falls_back_to_the_current_one(self):
+        with patch.object(QApplication, "screens", return_value=[]):
+            self.assertEqual(self.pet._virtual_desktop_rect(), self.pet.screen_rect)
 
 
 if __name__ == "__main__":

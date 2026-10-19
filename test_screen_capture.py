@@ -33,6 +33,59 @@ class TestBlocklist(unittest.TestCase):
         self.assertFalse(sc.is_blocked("Editor", "code", []))
         self.assertFalse(sc.is_blocked(None, None, [None, "", "  "]))
 
+    def test_reports_the_entry_that_matched(self):
+        self.assertEqual(
+            sc.blocklist_match("KEEPASSXC - vault", "keepassxc", ["keepass"]),
+            "keepass")
+        self.assertIsNone(sc.blocklist_match("Editor", "code", ["keepass"]))
+
+    def test_process_entries_match_the_process_not_the_title(self):
+        # The point of proc: is that a window *titled* "keepassxc" in a
+        # different program is not the app being protected.
+        self.assertTrue(sc.is_blocked("notes", "KeePassXC",
+                                      ["proc:keepassxc"]))
+        self.assertTrue(sc.is_blocked("notes", "keepassxc.exe",
+                                      ["proc:keepassxc"]))
+        self.assertFalse(sc.is_blocked("KeePassXC release notes", "firefox",
+                                       ["proc:keepassxc"]))
+        self.assertEqual(sc.blocklist_match("x", "keepassxc", ["proc:keepassxc"]),
+                         "proc:keepassxc")
+
+    def test_process_prefix_entries(self):
+        self.assertTrue(sc.is_blocked("x", "code-insiders", ["proc:code*"]))
+        self.assertFalse(sc.is_blocked("x", "vscode-server", ["proc:code*"]))
+
+    def test_pid_entries(self):
+        self.assertTrue(sc.is_blocked("x", "python", ["pid:4242"], pid=4242))
+        self.assertFalse(sc.is_blocked("x", "python", ["pid:4242"], pid=4243))
+        self.assertFalse(sc.is_blocked("x", "python", ["pid:4242"], pid=None))
+
+    def test_title_entries_only_look_at_the_title(self):
+        self.assertTrue(sc.is_blocked("Inbox - mail", "thunderbird",
+                                      ["title:inbox"]))
+        self.assertFalse(sc.is_blocked("Editor", "inbox-helper",
+                                       ["title:inbox"]))
+
+    def test_regex_entries(self):
+        self.assertTrue(sc.is_blocked("(3) Slack", "slack", [r"re:^\(\d+\)"]))
+        self.assertFalse(sc.is_blocked("Slack", "slack", [r"re:^\(\d+\)"]))
+
+    def test_broken_regex_is_ignored_rather_than_fatal(self):
+        self.assertTrue(sc.is_blocked("Editor", "code", ["re:(", "code"]))
+        self.assertFalse(sc.is_blocked("Editor", "code", ["re:("]))
+
+    def test_specific_rules_win_by_order(self):
+        # First match wins, so a narrow rule placed above a broad one decides
+        # which entry gets reported (and shown to the user).
+        self.assertEqual(
+            sc.blocklist_match("Editor", "code", ["code", "proc:code"]),
+            "code")
+
+    def test_entries_are_tolerant_of_whitespace_and_junk(self):
+        self.assertFalse(sc.is_blocked("Editor", "code",
+                                       [None, "   ", "proc:", "pid:", "title:"]))
+        self.assertTrue(sc.is_blocked("Editor", "code", ["  code  "]))
+
 
 class TestRedactionGuarantee(unittest.TestCase):
     def test_no_blocklist_always_safe(self):
@@ -170,6 +223,61 @@ class TestPrepareCapture(unittest.TestCase):
         with patch.object(wt, "window_detection_available", return_value=True):
             with patch.object(wt, "_detection_is_complete", return_value=False):
                 self.assertIsNone(sc.capture_with_redaction(_app, ["bank"], 70))
+
+    def test_the_window_list_is_refreshed_before_deciding(self):
+        # The poller's snapshot can be a poll interval old, and this snapshot
+        # decides whether the pixels may leave the machine.
+        with patch.object(wt, "window_detection_available", return_value=True):
+            with patch.object(wt, "_detection_is_complete", return_value=True):
+                with patch.object(sc, "grab_screen_image", return_value=None) as grab:
+                    before = self.tracker._query_os_windows.call_count
+                    self._prepare(["keepass"])
+                    self.assertGreater(self.tracker._query_os_windows.call_count,
+                                       before)
+                    grab.assert_called_once()
+
+    def test_refresh_can_be_skipped(self):
+        with patch.object(wt, "window_detection_available", return_value=True):
+            with patch.object(wt, "_detection_is_complete", return_value=True):
+                with patch.object(sc, "grab_screen_image", return_value=None):
+                    with patch.object(self.tracker, "get_windows") as windows:
+                        with patch.object(wt, "get_tracker",
+                                          return_value=self.tracker):
+                            with patch.object(self.tracker, "get_active_window",
+                                              return_value=self.active):
+                                sc.prepare_capture(_app, [], (0, 0, 1920, 1080),
+                                                   refresh_tracker=False)
+        windows.assert_not_called()
+
+
+class TestScanCapture(unittest.TestCase):
+    def test_refusal_is_passed_through(self):
+        with patch.object(sc, "ocr_guard", MagicMock()) as guard:
+            guard.scan_image.return_value = MagicMock(ok=False, reason="card number")
+            self.assertEqual(sc.scan_capture(MagicMock(), {}),
+                             (False, "card number"))
+
+    def test_clean_scan_is_allowed(self):
+        with patch.object(sc, "ocr_guard", MagicMock()) as guard:
+            guard.scan_image.return_value = MagicMock(ok=True, reason="")
+            self.assertEqual(sc.scan_capture(MagicMock(), {}), (True, ""))
+
+    def test_crash_fails_closed_by_default(self):
+        with patch.object(sc, "ocr_guard", MagicMock()) as guard:
+            guard.scan_image.side_effect = RuntimeError("boom")
+            ok, reason = sc.scan_capture(MagicMock(), {})
+        self.assertFalse(ok)
+        self.assertTrue(reason)
+
+    def test_crash_fails_open_when_configured_that_way(self):
+        with patch.object(sc, "ocr_guard", MagicMock()) as guard:
+            guard.scan_image.side_effect = RuntimeError("boom")
+            self.assertTrue(sc.scan_capture(MagicMock(),
+                                            {"fail_closed": False})[0])
+
+    def test_missing_module_allows_the_capture(self):
+        with patch.object(sc, "ocr_guard", None):
+            self.assertEqual(sc.scan_capture(MagicMock(), {}), (True, ""))
 
 
 if __name__ == "__main__":

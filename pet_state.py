@@ -32,8 +32,13 @@ DEFAULTS = {
     "energy": 100.0,
     "x": None,
     "y": None,
+    "display": None,
     "climb_enabled": True,
+    "allow_jump": True,
+    "allow_chase": True,
+    "click_through": False,
     "seconds_alive": 0.0,
+    "treats_given": 0,
     "last_seen": 0.0,
     "pet_count": 0,
 }
@@ -65,10 +70,19 @@ def _as_bool(value, default):
 class PetState:
     """Load/save the pet's persistent state."""
 
-    def __init__(self, path=None, save_interval=SAVE_INTERVAL):
+    def __init__(self, path=None, save_interval=SAVE_INTERVAL,
+                 energy_decay_per_hour=ENERGY_DECAY_PER_HOUR):
         self.path = path or DEFAULT_PATH
         self.save_interval = save_interval
+        # Configurable now: `state.energy_decay_per_hour` sat in the config
+        # file doing nothing while the constant below was what actually ran.
+        try:
+            self.energy_decay_per_hour = max(
+                0.0, float(energy_decay_per_hour))
+        except (TypeError, ValueError):
+            self.energy_decay_per_hour = ENERGY_DECAY_PER_HOUR
         self.data = dict(DEFAULTS)
+        self.lifetime_base = 0.0
         self._last_save = 0.0
         self._dirty = False
 
@@ -95,11 +109,19 @@ class PetState:
         data["energy"] = DEFAULTS["energy"] if energy is None else energy
         data["x"] = _clamp(stored.get("x"), -100000.0, 100000.0)
         data["y"] = _clamp(stored.get("y"), -100000.0, 100000.0)
+        display = stored.get("display")
+        data["display"] = str(display)[:120] if isinstance(display, str) and display else None
         data["climb_enabled"] = _as_bool(stored.get("climb_enabled"), True)
+        data["allow_jump"] = _as_bool(stored.get("allow_jump"), True)
+        data["allow_chase"] = _as_bool(stored.get("allow_chase"), True)
+        data["click_through"] = _as_bool(stored.get("click_through"), False)
         data["seconds_alive"] = _clamp(stored.get("seconds_alive"), 0.0, 1e9) or 0.0
+        treats = _clamp(stored.get("treats_given"), 0, 1e9)
+        data["treats_given"] = int(treats) if treats is not None else 0
         data["last_seen"] = _clamp(stored.get("last_seen"), 0.0, 1e12) or 0.0
         count = _clamp(stored.get("pet_count"), 0, 1e9)
         data["pet_count"] = int(count) if count is not None else 0
+        self.lifetime_base = float(data["seconds_alive"])
         return data
 
     def hours_away(self, now=None):
@@ -120,8 +142,23 @@ class PetState:
         if away <= GRACE_PERIOD_HOURS:
             return max(0.0, min(100.0, self.data.get("energy") or 0.0))
         away = min(away - GRACE_PERIOD_HOURS, 8.0)
-        decay = away * ENERGY_DECAY_PER_HOUR
+        decay = away * self.energy_decay_per_hour
         return max(0.0, min(100.0, (self.data.get("energy") or 100.0) - decay))
+
+    def total_seconds_alive(self, session_seconds=0.0):
+        """Lifetime seconds alive, this session included.
+
+        `seconds_alive` used to be *overwritten* with the current session's
+        uptime on every save, so the counter reset to a few seconds on every
+        restart and never added up to anything. The lifetime total is pinned
+        when the file is loaded and only the running session is added on top,
+        so repeated saves cannot double-count.
+        """
+        try:
+            session = max(0.0, float(session_seconds))
+        except (TypeError, ValueError):
+            session = 0.0
+        return min(1e9, self.lifetime_base + session)
 
     # ---- saving --------------------------------------------------------
 
@@ -148,6 +185,12 @@ class PetState:
         try:
             with open(tmp, "w", encoding="utf-8") as handle:
                 json.dump(self.data, handle, indent=2)
+            try:
+                # This file records where someone was and when. It has no
+                # business being world-readable.
+                os.chmod(tmp, 0o600)
+            except OSError:
+                pass
             os.replace(tmp, self.path)
         except OSError:
             try:
@@ -158,6 +201,7 @@ class PetState:
     def forget(self):
         """Delete the saved state (used by the context menu)."""
         self.data = dict(DEFAULTS)
+        self.lifetime_base = 0.0
         try:
             os.unlink(self.path)
         except OSError:

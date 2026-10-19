@@ -2,3 +2,9 @@ PyQt5
 groq
 psutil
 python-xlib ; sys_platform == "linux"
+
+# Optional, not a Python package: the OCR content filter shells out to the
+# `tesseract` binary. Install it with your system package manager
+# (apt install tesseract-ocr / pacman -S tesseract / brew install tesseract).
+# Without it, screenshots are refused rather than sent unfiltered while
+# screenshots.ocr.fail_closed is true (the default).

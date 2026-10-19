@@ -41,13 +41,34 @@ except Exception:
 
 
 def _get_process_name(pid: Optional[int]) -> str:
-    """Safely get a process name from a PID."""
+    """Safely get a process name from a PID.
+
+    Cached briefly: the window list is rebuilt every poll and each window used
+    to cost one psutil call (process lookup + /proc walk). PIDs are reused and
+    a process can exec a different binary, so the cache is short-lived rather
+    than permanent.
+    """
     if not psutil or not pid:
         return ""
+    now = time.monotonic()
+    with _process_cache_lock:
+        fresh = _process_cache.get(int(pid))
+        if fresh is not None and now - fresh[1] < PROCESS_CACHE_TTL:
+            return fresh[0]
     try:
-        return psutil.Process(pid).name()
+        name = psutil.Process(pid).name()
     except Exception:
-        return ""
+        name = ""
+    with _process_cache_lock:
+        if len(_process_cache) > 512:
+            _process_cache.clear()
+        _process_cache[int(pid)] = (name, now)
+    return name
+
+
+PROCESS_CACHE_TTL = 30.0
+_process_cache: dict = {}
+_process_cache_lock = threading.Lock()
 
 
 # =====================================================================
@@ -137,6 +158,8 @@ class WindowSnapshot(NamedTuple):
     detection_works: bool
     active: Optional[WindowInfo] = None
     detection_complete: bool = False
+    active_fullscreen: bool = False
+    user_idle: Optional[float] = None
 
 
 # =====================================================================
@@ -416,6 +439,7 @@ _X11_ATOM_NAMES = (
     "_NET_WM_NAME",
     "_NET_WM_PID",
     "_NET_WM_STATE",
+    "_NET_WM_STATE_FULLSCREEN",
     "_NET_WM_STATE_HIDDEN",
     "_NET_WM_WINDOW_TYPE",
     "_NET_WM_WINDOW_TYPE_DESKTOP",
@@ -635,6 +659,66 @@ def _linux_active_window() -> Optional[WindowInfo]:
         )
     except Exception:
         return None
+
+
+# =====================================================================
+# Fullscreen detection
+# =====================================================================
+
+def _x11_active_window_fullscreen() -> Optional[bool]:
+    """Whether the focused X11 window advertises `_NET_WM_STATE_FULLSCREEN`.
+
+    None means "cannot tell" (no Xlib, no focused window, no EWMH), so the
+    caller can fall back to comparing rectangles instead of concluding False.
+    """
+    d = _get_xlib()
+    if not d:
+        return None
+    try:
+        root = d.screen().root
+        atoms = _intern_atoms(d)
+        prop = root.get_full_property(atoms["_NET_ACTIVE_WINDOW"], 0)
+        if not prop or not prop.value:
+            return None
+        win = d.create_resource_object("window", prop.value[0])
+        state = win.get_full_property(atoms["_NET_WM_STATE"], 0)
+        if not state or not state.value:
+            return False
+        return atoms["_NET_WM_STATE_FULLSCREEN"] in list(state.value)
+    except Exception:
+        return None
+
+
+def rect_covers_screen(rect, screen_rect, tolerance: float = 0.02) -> bool:
+    """Whether a window rect covers (almost) a whole screen.
+
+    The geometric half of fullscreen detection, and the only one available on
+    Windows. A window that fills the monitor but keeps a decoration strip
+    still counts: that is what a maximised fullscreen video looks like.
+    """
+    if not rect or not screen_rect:
+        return False
+    left, top, right, bottom = rect
+    s_left, s_top, s_right, s_bottom = screen_rect
+    width = max(1, s_right - s_left)
+    height = max(1, s_bottom - s_top)
+    slack_x = width * tolerance
+    slack_y = height * tolerance
+    return (left <= s_left + slack_x and right >= s_right - slack_x
+            and top <= s_top + slack_y and bottom >= s_bottom - slack_y)
+
+
+def is_fullscreen_window(window, screen_rect, x11_state: Optional[bool] = None) -> bool:
+    """Best effort "is this window covering the screen it is on".
+
+    Prefers the window manager's own answer (X11), falls back to geometry.
+    """
+    if window is None:
+        return False
+    if x11_state:
+        return True
+    return rect_covers_screen(getattr(window, "rect", None), screen_rect)
+
 
 
 # =====================================================================
@@ -949,6 +1033,15 @@ class WindowTracker:
                     _linux_active_window() if IS_LINUX else None)
             except Exception:
                 active = None
+            try:
+                active_state = (_x11_active_window_fullscreen()
+                                if IS_LINUX and not IS_WIN else None)
+            except Exception:
+                active_state = None
+            try:
+                user_idle = idle_seconds()
+            except Exception:
+                user_idle = None
 
         windows = []
         for w in raw_windows:
@@ -966,6 +1059,9 @@ class WindowTracker:
             self._cached_windows = windows
             self._cached_taskbar = self._scaled(taskbar) if taskbar else None
             screen_rect = self._screen_rect or virtual_screen_rect()
+            active_info = None if active is None else WindowInfo(
+                id=active.id, title=active.title, rect=self._scaled(active.rect),
+                process=active.process, pid=active.pid)
             self._snapshot = WindowSnapshot(
                 windows=windows,
                 taskbar=self._cached_taskbar,
@@ -976,10 +1072,11 @@ class WindowTracker:
                 screen_rect=screen_rect,
                 at=self._last_poll_time,
                 detection_works=window_detection_available(),
-                active=None if active is None else WindowInfo(
-                    id=active.id, title=active.title, rect=self._scaled(active.rect),
-                    process=active.process, pid=active.pid),
+                active=active_info,
                 detection_complete=_detection_is_complete(),
+                active_fullscreen=is_fullscreen_window(active_info, screen_rect,
+                                                       x11_state=active_state),
+                user_idle=user_idle,
             )
             return self._snapshot
 
@@ -1098,6 +1195,25 @@ class WindowTracker:
         except Exception:
             pass
         return None
+
+    def fullscreen_active(self) -> bool:
+        """Whether the focused window is covering the screen right now.
+
+        Read from the cached snapshot so this is safe to call at tick rate
+        from the GUI thread; the OS query (including the X11 EWMH state)
+        happens in `_refresh` on the poller.
+        """
+        with self._lock:
+            return bool(self._snapshot.active_fullscreen)
+
+    def user_idle_seconds(self) -> Optional[float]:
+        """Seconds since the last user input, from the cached snapshot.
+
+        None when the platform cannot tell; the pet then falls back to its own
+        "has the cursor moved" signal.
+        """
+        with self._lock:
+            return self._snapshot.user_idle
 
     def get_walkable_ledges(self, screen_rect: Any = None,
                             force_refresh: bool = False) -> List[WalkableLedge]:
@@ -1299,3 +1415,50 @@ def find_nearby_climbable(pet_x: float, pet_y: float, sprite_w: int, sprite_h: i
 def detection_is_complete() -> bool:
     """Public: can we see every window? False under Wayland, by design."""
     return _detection_is_complete()
+
+
+def fullscreen_active() -> bool:
+    """Whether the focused window covers the screen (a game, a video)."""
+    return get_tracker().fullscreen_active()
+
+
+def idle_seconds() -> Optional[float]:
+    """Seconds since the last user input, when the platform can tell us.
+
+    X11: the XScreenSaver extension, which is what xprintidle uses. Windows:
+    GetLastInputInfo. Returns None when there is no answer, and the pet falls
+    back to its own cursor-activity signal.
+    """
+    if IS_WIN:
+        try:
+            import ctypes
+
+            class LASTINPUTINFO(ctypes.Structure):
+                _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
+
+            info = LASTINPUTINFO()
+            info.cbSize = ctypes.sizeof(LASTINPUTINFO)
+            if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(info)):
+                return None
+            millis = int(ctypes.windll.kernel32.GetTickCount()) - int(info.dwTime)
+            return max(0.0, millis / 1000.0)
+        except Exception:
+            return None
+    if IS_LINUX:
+        try:
+            from Xlib.ext import screensaver
+        except Exception:
+            return None
+        d = _get_xlib()
+        if not d:
+            return None
+        try:
+            extension = screensaver.query_extension(d)
+            if not getattr(extension, "present", False):
+                return None
+            info = screensaver.query_info(d)
+            return float(info.ms_since_user_input) / 1000.0
+        except Exception:
+            return None
+    return None
+

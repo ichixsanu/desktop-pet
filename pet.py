@@ -33,9 +33,10 @@ import traceback
 
 # HiDPI attributes must be set before QApplication exists, so this import has
 # to stay above main().
-from PyQt5.QtCore import Qt, QTimer, QPoint, QObject, pyqtSignal
+from PyQt5.QtCore import Qt, QTimer, QPoint, QObject, pyqtSignal, QRect
 from PyQt5.QtGui import (QPainter, QPixmap, QColor, QFont, QCursor,
-                         QTransform, QFontMetrics, QPolygon, QFontDatabase)
+                         QTransform, QFontMetrics, QPolygon, QFontDatabase,
+                         QIcon)
 from PyQt5.QtWidgets import QApplication, QWidget, QMenu, QAction
 
 import ai_companion
@@ -49,13 +50,27 @@ except Exception:
     window_tracker = None
 
 try:
+    import ocr_guard
+except Exception:
+    ocr_guard = None
+
+try:
     import companion_dialogue
 except Exception:
     companion_dialogue = None
 
+try:
+    from PyQt5.QtWidgets import QSystemTrayIcon
+except Exception:  # pragma: no cover - some Qt builds lack it
+    QSystemTrayIcon = None
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SKINS_DIR = os.path.join(BASE_DIR, "skins")
 LOG_PATH = os.path.join(BASE_DIR, "pet.log")
+
+# Keep the log from growing without bound: it is appended to by every guarded
+# failure and nothing ever truncated it.
+LOG_MAX_BYTES = 512 * 1024
 
 # The pet's own window must never be a ledge for the pet to stand on.
 PET_WINDOW_TITLE = "desktop-pet-overlay"
@@ -135,6 +150,14 @@ MOOD_HAPPY_MIN = 70.0    # above this energy and recently petted: happy
 FOCUS_POLL_TICKS = 100
 CONTEXT_CHECK_INTERVAL = 600
 SAVE_INTERVAL_TICKS = 600   # 30s at 20 FPS
+# How often the config file is checked for edits (5s), and how often the
+# fullscreen state is looked at (1s).
+CONFIG_RELOAD_TICKS = 100
+FULLSCREEN_CHECK_TICKS = 20
+TICKS_PER_SECOND = 20.0
+# A context line is handed to the model at most this often, and only when the
+# idle rate-limit pool agrees.
+AI_CONTEXT_CHANCE = 0.35
 # A context check only counts as activity if the focused window actually
 # changed, otherwise the "is anyone there" gate is satisfied forever.
 CURSOR_ACTIVITY_PX = 3
@@ -184,6 +207,7 @@ def log_exception(context=""):
     text = traceback.format_exc()
     try:
         with _log_lock:
+            _rotate_log_unlocked()
             with open(LOG_PATH, "a", encoding="utf-8") as f:
                 f.write("[%s] %s\n%s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"),
                                           context or "exception", text))
@@ -191,6 +215,30 @@ def log_exception(context=""):
         pass
     if os.environ.get("PET_DEBUG"):
         sys.stderr.write(text)
+
+
+def _rotate_log_unlocked():
+    """Rename pet.log to pet.log.1 when it gets too big.
+
+    Called under `_log_lock` from both the rotating writer and startup.
+    """
+    try:
+        if os.path.getsize(LOG_PATH) < LOG_MAX_BYTES:
+            return
+        rotated = LOG_PATH + ".1"
+        try:
+            os.unlink(rotated)
+        except OSError:
+            pass
+        os.replace(LOG_PATH, rotated)
+    except OSError:
+        pass
+
+
+def rotate_log():
+    """Startup size check (see _rotate_log_unlocked)."""
+    with _log_lock:
+        _rotate_log_unlocked()
 
 
 def guarded(slot):
@@ -243,6 +291,14 @@ def _mem_percent():
 
 
 def _battery_percent():
+    """Battery charge, from the machine's own battery where possible.
+
+    The old code returned the first `/sys/class/power_supply` entry that had a
+    `capacity` file, which on a laptop with a mouse, a headset or a UPS also
+    plugged in can be any of those: the pet then announced "low battery" for
+    a peripheral. `type` has to say "Battery", a non-present bay is skipped,
+    and the main battery is preferred by name when there is more than one.
+    """
     try:
         if sys.platform.startswith("win"):
             import ctypes
@@ -259,14 +315,39 @@ def _battery_percent():
             ctypes.windll.kernel32.GetSystemPowerStatus(ctypes.byref(status))
             return status.BatteryLifePercent if 0 <= status.BatteryLifePercent <= 100 else None
         base = "/sys/class/power_supply"
-        for name in os.listdir(base):
-            cap_path = os.path.join(base, name, "capacity")
-            if os.path.exists(cap_path):
-                with open(cap_path) as f:
-                    return int(f.read().strip())
+        candidates = []
+        for name in sorted(os.listdir(base)):
+            directory = os.path.join(base, name)
+            cap_path = os.path.join(directory, "capacity")
+            if not os.path.exists(cap_path):
+                continue
+            if _read_sys_file(os.path.join(directory, "present")) == "0":
+                continue
+            kind = (_read_sys_file(os.path.join(directory, "type")) or "").lower()
+            if kind and kind != "battery":
+                continue          # mains adapter, USB, mouse, UPS...
+            candidates.append((0 if name.upper().startswith("BAT") else 1, name, cap_path))
+        for _rank, _name, cap_path in sorted(candidates):
+            raw = _read_sys_file(cap_path)
+            if raw is None:
+                continue
+            try:
+                value = int(float(raw))
+            except (TypeError, ValueError):
+                continue
+            if 0 <= value <= 100:
+                return value
+        return None
     except Exception:
         return None
-    return None
+
+
+def _read_sys_file(path):
+    try:
+        with open(path) as handle:
+            return handle.read().strip()
+    except OSError:
+        return None
 
 
 def system_status():
@@ -375,10 +456,20 @@ def discover_skins():
         return []
 
 
+def _parse_clock(text):
+    """'23:00' -> 1380 minutes past midnight, or None."""
+    try:
+        hours, _, minutes = str(text).partition(":")
+        return (int(hours) % 24) * 60 + int(minutes or 0) % 60
+    except (TypeError, ValueError):
+        return None
+
+
 class AIBridge(QObject):
     """Relays model replies from worker threads back onto the GUI thread."""
 
     line_ready = pyqtSignal(str, str)  # (text, status)
+    notice = pyqtSignal(str)           # worker-side status, no model text
 
 
 class DesktopPet(QWidget):
@@ -406,7 +497,6 @@ class DesktopPet(QWidget):
             self.available_skins[0] if self.available_skins else "cat")
         self.load_skin(self.current_skin)
         self.heart_pixmap = self._make_heart()
-
         # ---- screen geometry ----
         self.screen_rect = (0, 0, 1280, 720)  # absolute, refreshed below
         self.screen_left = 0
@@ -480,8 +570,10 @@ class DesktopPet(QWidget):
         self.awaiting_ai = False
         self.ai_deadline = 0
         self.ai_request_kind = "idle"   # 'idle' | 'user' | 'screenshot'
+        self._ai_timed_out = False      # a canned line already covered this one
         self.ai_bridge = AIBridge(self)
         self.ai_bridge.line_ready.connect(self._on_ai_line)
+        self.ai_bridge.notice.connect(self._on_notice)
 
         # ---- window tracker ----
         self.tracker = None
@@ -504,6 +596,17 @@ class DesktopPet(QWidget):
         # ---- screenshot state ----
         self._screenshot_inflight = False
         self._pending_capture = False
+        # Fullscreen apps (games, video) are not for perching on, and not for
+        # interrupting: the pet hides for the duration.
+        self._hidden_for_fullscreen = False
+        self._capture_was_visible = False
+        self._screenshot_source = "auto"   # 'auto' | 'manual'
+
+        # ---- interaction extras ----
+        self.click_through = False
+        self._treat_until_tick = 0
+        self.tray = None
+        self.tray_menu = None
 
         # ---- focus / pomodoro awareness ----
         focus_cfg = self._settings().get("focus", {})
@@ -518,6 +621,8 @@ class DesktopPet(QWidget):
         self._restore_state()
 
         # ---- monitor change handling ----
+        self._screen_signals = set()
+        self._bind_screen_signals()
         app = QApplication.instance()
         if app is not None:
             for signal in ("screenAdded", "screenRemoved", "primaryScreenChanged"):
@@ -561,7 +666,9 @@ class DesktopPet(QWidget):
         try:
             store = pet_state.PetState(
                 self._state_path(),
-                save_interval=cfg.get("save_interval_seconds", 30))
+                save_interval=cfg.get("save_interval_seconds", 30),
+                energy_decay_per_hour=cfg.get("energy_decay_per_hour",
+                                               pet_state.ENERGY_DECAY_PER_HOUR))
             data = store.load()
             self.state_store = store
 
@@ -575,14 +682,23 @@ class DesktopPet(QWidget):
 
             self.energy = store.rested_energy()
             self.climb_enabled = bool(data.get("climb_enabled", True))
-            self.allow_jump = bool(self._behaviour().get("allow_jump", True))
-            self.allow_chase = bool(self._behaviour().get("allow_chase", True))
+            # The menu toggles win over the config file: they are the more
+            # recent, explicit choice, and they now survive a restart.
+            behaviour = self._behaviour()
+            self.allow_jump = bool(data.get("allow_jump",
+                                            behaviour.get("allow_jump", True)))
+            self.allow_chase = bool(data.get("allow_chase",
+                                             behaviour.get("allow_chase", True)))
+            self.click_through = bool(data.get("click_through", False))
 
             data["pet_count"] = (data.get("pet_count") or 0) + 1
             store.touch(pet_count=data["pet_count"])
             store.save(force=True)
 
-            # Only resume a position that still lands on a connected display.
+            # Only resume a position that still lands on a connected display,
+            # and prefer the monitor the pet was left on: a laptop unplugged
+            # from its dock has to put the pet back on the laptop screen.
+            self._restore_display(data.get("display"))
             x, y = data.get("x"), data.get("y")
             if x is not None and y is not None:
                 screen = self._screen_for_point(x + self.sprite_w / 2,
@@ -594,8 +710,29 @@ class DesktopPet(QWidget):
                     self._enter_sit()
                     if not self._is_on_ledge():
                         self.y_pos = self.floor_y
+            self._apply_click_through()
         except Exception:
             log_exception("state restore")
+
+    def _restore_display(self, name):
+        """Follow the pet back to the monitor it was left on, if it is here."""
+        if not name:
+            return
+        app = QApplication.instance()
+        if app is None:
+            return
+        for screen in app.screens():
+            if screen.name() == name:
+                if self._screen_for_point(self.x_pos, self.y_pos) is not screen:
+                    self.screen_left = screen.geometry().x()
+                    self.screen_top = screen.geometry().y()
+                    self.screen_w = screen.geometry().width()
+                    self.screen_h = screen.geometry().height()
+                    self.x_pos = float(self.screen_left + self.screen_w // 2
+                                       - self.sprite_w // 2)
+                    self.y_pos = float(self.screen_top + self.screen_h
+                                       - self.sprite_h)
+                return
 
     def _save_state(self, force=False):
         if self.state_store is None:
@@ -604,12 +741,25 @@ class DesktopPet(QWidget):
             self.state_store.touch(
                 skin=self.current_skin, scale=self.scale_factor,
                 energy=self.energy, x=self.x_pos, y=self.y_pos,
+                display=self._screen_name(),
                 climb_enabled=self.climb_enabled,
-                seconds_alive=time.time() - self.session_start,
+                allow_jump=self.allow_jump,
+                allow_chase=self.allow_chase,
+                click_through=self.click_through,
+                seconds_alive=self.state_store.total_seconds_alive(
+                    time.time() - self.session_start),
             )
             self.state_store.save(force=force)
         except Exception:
             log_exception("state save")
+
+    def _screen_name(self):
+        try:
+            screen = self._screen_for_point(self.x_pos + self.sprite_w / 2,
+                                            self.y_pos + self.sprite_h / 2)
+            return screen.name() if screen is not None else None
+        except Exception:
+            return None
 
     def forget_state(self):
         if self.state_store is not None:
@@ -641,6 +791,7 @@ class DesktopPet(QWidget):
     @guarded
     def _on_screen_change(self, *_args):
         """Monitor plugged, unplugged, or resolution changed."""
+        self._bind_screen_signals()
         self._refresh_screen_geometry()
         if self.tracker is not None:
             self.tracker.set_coordinate_scale(self._display_scale())
@@ -655,6 +806,30 @@ class DesktopPet(QWidget):
         if self.is_ghost:
             self.ghost_hover_y = self.floor_y - 6.0
         self._sync_widget_geometry()
+
+    def _bind_screen_signals(self):
+        """Follow the monitors' own geometry signals.
+
+        `screenAdded`/`screenRemoved` never fire for a resolution change or a
+        taskbar moving, so the floor was stale after a dock/undock or a
+        rotate, and the pet stood in mid-air until something else happened to
+        refresh it. `geometryChanged`/`availableGeometryChanged` do fire.
+        """
+        app = QApplication.instance()
+        if app is None:
+            return
+        for screen in app.screens():
+            for emitter in (getattr(screen, "geometryChanged", None),
+                            getattr(screen, "availableGeometryChanged", None)):
+                if emitter is None:
+                    continue
+                try:
+                    if id(emitter) in self._screen_signals:
+                        continue
+                    emitter.connect(self._on_screen_change)
+                    self._screen_signals.add(id(emitter))
+                except Exception:
+                    pass
 
     def _refresh_screen_geometry(self):
         """Recompute the display box the pet lives in.
@@ -689,10 +864,21 @@ class DesktopPet(QWidget):
     # =================================================================
 
     def _make_heart(self):
+        """Load the heart sprite, sized to the pet rather than to a constant.
+
+        It used to be scaled to 18x16 no matter what: a speck next to a 4x
+        pet, and half the pet's size at 1x.
+        """
         path = os.path.join(SKINS_DIR, "_heart.png")
-        if os.path.exists(path):
-            return QPixmap(path).scaled(18, 16, Qt.KeepAspectRatio, Qt.FastTransformation)
-        return None
+        if not os.path.exists(path):
+            return None
+        source = QPixmap(path)
+        if source.isNull():
+            return None
+        width = max(6, int(round(source.width() * self.scale_factor / 2.0)))
+        height = max(5, int(round(source.height() * self.scale_factor / 2.0)))
+        return source.scaled(width, height, Qt.KeepAspectRatio,
+                             Qt.FastTransformation)
 
     def _load_scaled(self, path):
         pix = QPixmap(path)
@@ -742,6 +928,9 @@ class DesktopPet(QWidget):
         self._refresh_screen_geometry()
         if self.is_ghost:
             self.ghost_hover_y = self.floor_y - 6.0
+        # Rebuild the heart at the new scale: 16px art next to a 4x pet used to
+        # look like a speck.
+        self.heart_pixmap = self._make_heart()
 
     def _build_frame_table(self):
         """Resolve each FSM state to a concrete frame list, once."""
@@ -862,24 +1051,66 @@ class DesktopPet(QWidget):
         deliberately skipped request must stay silent instead of firing off an
         unsolicited random line, which is what used to happen every 15 minutes
         once the screenshot caps were hit.
+
+        A user-initiated request always says *something*: if the model was
+        throttled ("skipped") or unavailable, the companion's canned line
+        covers it. Silently doing nothing when the user clicks Speak reads as
+        a broken menu item.
         """
         kind = self.ai_request_kind
         self.awaiting_ai = False
+        late = self._ai_timed_out
+        self._ai_timed_out = False
+
         if status == ai_companion.STATUS_OK and text:
+            if late and self.speech_timer > 0:
+                # A newer line is already on screen: a reply that missed its
+                # own deadline must not overwrite it mid-sentence.
+                return
             self.speak(text)
-        elif status == ai_companion.STATUS_UNAVAILABLE and kind == "user":
-            # The user explicitly asked for a line; give them the canned one.
+            return
+
+        if kind == "user" and status in (ai_companion.STATUS_UNAVAILABLE,
+                                         ai_companion.STATUS_SKIPPED):
             self.speak(get_system_status_quote(self.current_skin))
 
     def request_dialogue(self, user_initiated=True):
         """Ask for a line: model first, then the canned fallback."""
+        if self._quiet_now() and not user_initiated:
+            return
         if ai_companion.ai_enabled():
             self.awaiting_ai = True
             self.ai_deadline = self.tick_count + 90
             self.ai_request_kind = "user" if user_initiated else "idle"
-            ai_companion.maybe_idle_line(self.current_skin, self.ai_bridge.line_ready.emit)
+            ai_companion.maybe_idle_line(
+                self.current_skin, self.ai_bridge.line_ready.emit,
+                kind="user" if user_initiated else "idle")
             return
         self.speak(get_system_status_quote(self.current_skin))
+
+    def _quiet_now(self, now=None):
+        """Whether quiet hours are suppressing unsolicited chatter.
+
+        Only the pet's own initiative is muted: clicking Speak, petting it, or
+        asking for a look always answers.
+        """
+        cfg = self._behaviour().get("quiet_hours") or {}
+        if not cfg.get("enabled", False):
+            return False
+        try:
+            start = _parse_clock(cfg.get("start", "23:00"))
+            end = _parse_clock(cfg.get("end", "07:00"))
+        except Exception:
+            return False
+        if start is None or end is None:
+            return False
+        current = time.localtime(now if now is not None else time.time())
+        minutes = current.tm_hour * 60 + current.tm_min
+        if start == end:
+            return False
+        if start < end:
+            return start <= minutes < end
+        return minutes >= start or minutes < end   # wraps midnight
 
     def _speak_contextual(self, event_type):
         """Speak a canned line from the companion's dialogue table."""
@@ -892,51 +1123,103 @@ class DesktopPet(QWidget):
     # Screenshots
     # =================================================================
 
+    def _hide_for_capture(self):
+        """Unmap the pet so it is not in its own screenshot.
+
+        Its speech bubble ("one sec, looking") is exactly the sort of thing
+        the model would otherwise comment on.
+        """
+        self._capture_was_visible = self.isVisible()
+        if self._capture_was_visible:
+            self.hide()
+
+    def _show_after_capture(self):
+        if self._capture_was_visible and not self._hidden_for_fullscreen:
+            self.show()
+            self._restack_on_top()
+
+    def _restack_on_top(self, force=False):
+        """Re-assert always-on-top after the window was unmapped.
+
+        Hiding and showing a window gives the window manager a new mapping,
+        and the "above" state is not guaranteed to survive it: the pet came
+        back *behind* the window it was covering, which is exactly what
+        happens after every Look At This. Re-applying the flags forces the
+        request back onto the WM; raise_() puts it back on top of the stack.
+        """
+        try:
+            if not force and not self.isVisible():
+                return
+            flags = (Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+            if self.click_through:
+                flags |= Qt.WindowTransparentForInput
+            self.setWindowFlags(flags)
+            self.setAttribute(Qt.WA_TranslucentBackground)
+            self.setAttribute(Qt.WA_ShowWithoutActivating)
+            self.show()
+            self.raise_()
+        except Exception:
+            log_exception("restack")
+
     def maybe_screenshot(self, force=False):
         """Occasionally grab the screen for a comment.
 
         The policy (interval, hourly and daily caps, AI availability) lives in
         ai_companion so there is one implementation of it. Pixels are grabbed
-        here on the GUI thread because QPixmap demands it; redaction, JPEG
-        encoding and the API call all happen on a worker.
+        here on the GUI thread because QPixmap demands it; redaction, the OCR
+        content filter, JPEG encoding and the API call all happen on a worker.
 
         `force` is the "Look at this" menu action: it skips the interval and
-        hourly caps, but never the blocklist -- privacy is not a quota.
+        hourly caps, but never the daily cap, the blocklist or the scan --
+        privacy is not a quota.
         """
         if self._screenshot_inflight:
             return
-        settings = ai_companion.screenshot_settings()
-        if not (settings.get("enabled", False) or force):
+        if self._hidden_for_fullscreen:
             return
-        if not force:
+        # Config edits apply immediately, so switching screenshots off in the
+        # file actually switches them off in the running pet.
+        ai_companion.reload_config_if_changed()
+        settings = ai_companion.screenshot_settings()
+
+        manual = bool(force)
+        if not manual:
+            # Hard gate: an automatic capture only ever happens when the
+            # feature is enabled. Nothing else may produce one.
+            if not settings.get("enabled", False):
+                return
+            if self._quiet_now():
+                return
             required = float(settings.get("require_recent_activity_minutes", 3)) * 60 * 20
             if self.tick_count - self.last_activity_tick > required:
                 return
             if not ai_companion.screenshot_slot_ok():
                 return
-        elif not ai_companion.ai_enabled():
-            # Nothing to send it to; don't grab the screen for no reason.
-            return
         else:
-            ai_companion.reserve_forced_screenshot()
+            if not ai_companion.ai_enabled():
+                # Nothing to send it to; don't grab the screen for no reason.
+                ai_companion.note_capture_decision("refused", "AI is off")
+                return
+            if not ai_companion.reserve_forced_screenshot():
+                # The result of this used to be dropped, so a user-initiated
+                # capture ignored the daily cap entirely.
+                ai_companion.note_capture_decision("refused", "daily capture cap reached")
+                self._speak_contextual("screenshot_blocked")
+                return
 
+        self._screenshot_source = "manual" if manual else "auto"
         app = QApplication.instance()
-        # Hide the pet for the duration of the grab. Its own speech bubble is
-        # not something to send to the model, and the model will happily
-        # comment on the pet commenting on the screen. Unmapping and mapping
-        # back within one event-loop turn costs nothing visible.
-        was_visible = self.isVisible()
-        self.hide()
+        self._hide_for_capture()
         try:
             image, reason = screen_capture.prepare_capture(
                 app, settings.get("blocklist", []), self.screen_rect)
         finally:
-            if was_visible:
-                self.show()
+            self._show_after_capture()
         if image is None:
             # Blocked or unavailable: release the slot, and say so once in a
             # while so a refusal is visible rather than mysterious.
             ai_companion.record_capture_attempt(False)
+            ai_companion.note_capture_decision("refused", reason or "no capture")
             if reason:
                 self._speak_contextual("screenshot_blocked")
             return
@@ -945,7 +1228,9 @@ class DesktopPet(QWidget):
         skin = self.current_skin
         quality = int(settings.get("jpeg_quality", 70))
         blocklist = settings.get("blocklist", [])
+        ocr_config = ai_companion.ocr_settings()
         screen_rect = self.screen_rect
+        manual_flag = manual
 
         def worker():
             # QImage work: safe off the GUI thread, and this is where the
@@ -953,11 +1238,20 @@ class DesktopPet(QWidget):
             captured = False
             try:
                 screen_capture.redact(image, blocklist, screen_rect)
+                allowed, why = screen_capture.scan_capture(image, ocr_config)
+                if not allowed:
+                    # Discard, do not send, do not keep: the whole point of the
+                    # filter is that this image never leaves the machine.
+                    ai_companion.note_capture_decision("discarded", why)
+                    self._report_discarded_capture()
+                    return
                 encoded = screen_capture.encode_jpeg_base64(image, quality)
                 captured = bool(encoded)
                 if encoded:
+                    ai_companion.note_capture_decision("sent", "")
                     ai_companion.request_screenshot_comment(
-                        skin, encoded, self.ai_bridge.line_ready.emit, manual=force)
+                        skin, encoded, self.ai_bridge.line_ready.emit,
+                        manual=manual_flag)
             except Exception:
                 log_exception("screenshot worker")
             finally:
@@ -965,6 +1259,23 @@ class DesktopPet(QWidget):
                 self._screenshot_inflight = False
 
         threading.Thread(target=worker, name="screenshot", daemon=True).start()
+
+    def _report_discarded_capture(self):
+        """Tell the user a capture was dropped, from the GUI thread.
+
+        Queued rather than called directly: the worker is not allowed to touch
+        the widget.
+        """
+        try:
+            self.ai_bridge.notice.emit("discarded")
+        except Exception:
+            pass
+
+    @guarded
+    def _on_notice(self, kind):
+        """Side-channel notice from a worker (no model involved)."""
+        if kind == "discarded":
+            self._speak_contextual("screenshot_blocked")
 
     # =================================================================
     # Context checks
@@ -991,7 +1302,13 @@ class DesktopPet(QWidget):
             self.last_activity_tick = self.tick_count
 
     def _check_window_context(self):
-        """Occasionally say something about what the user is doing."""
+        """Occasionally say something about what the user is doing.
+
+        With the model available the pet gets a real line about the window it
+        is looking at; the canned table covers everything else (no key, rate
+        limited, quiet hours). Both paths share the idle rate-limit pool, so
+        the cost is bounded either way.
+        """
         if self.speech_timer > 0 or self.awaiting_ai:
             return
         if self.state in ("SLEEP", "DRAG", "FALL", "PERCH"):
@@ -999,14 +1316,18 @@ class DesktopPet(QWidget):
         if companion_dialogue is None:
             return
         # Mid-focus the pet keeps its mouth shut: that is the whole point of a
-        # focus block.
-        if self.in_focus():
+        # focus block. Quiet hours do the same for unsolicited lines.
+        if self.in_focus() or self._quiet_now():
             return
 
         # Mood first: a drowsy pet does not have opinions about your window.
         mood_event = self._mood_event()
         if mood_event:
             self._speak_contextual(mood_event)
+            return
+
+        if self._ai_context_lines_enabled() and random.random() < AI_CONTEXT_CHANCE \
+                and self._request_context_line():
             return
 
         if self.last_window_title and random.random() < 0.7:
@@ -1017,6 +1338,35 @@ class DesktopPet(QWidget):
             self.current_skin, event_type=event,
             window_title=self.last_window_title or "",
             window_proc=self.last_window_proc or ""))
+
+    def _ai_context_lines_enabled(self):
+        """Whether idle chatter may use the model (behaviour.ai_context_lines).
+
+        Off means the pet still talks about your windows, just from the canned
+        table: no tokens, no network, no surprises on a metered connection.
+        """
+        return bool(self._behaviour().get("ai_context_lines", True))
+
+    def _request_context_line(self):
+        """Ask the model about the focused window. True if the request started.
+
+        The prompt carries only what the window tracker already sees -- a
+        title and a process name, never pixels -- so this is not a screenshot
+        by another name.
+        """
+        if not ai_companion.ai_enabled():
+            return False
+        if not self.last_window_title:
+            return False
+        context = "window title: %r (process %r)" % (
+            self.last_window_title[:80], (self.last_window_proc or "")[:40])
+        started = ai_companion.maybe_context_line(
+            self.current_skin, context, self.ai_bridge.line_ready.emit)
+        if started:
+            self.awaiting_ai = True
+            self.ai_deadline = self.tick_count + 90
+            self.ai_request_kind = "idle"
+        return started
 
     # =================================================================
     # Mood and energy
@@ -1214,9 +1564,15 @@ class DesktopPet(QWidget):
             self.last_activity_tick = self.tick_count
         self.last_cursor = cursor
 
+        if self.tick_count % CONFIG_RELOAD_TICKS == 0:
+            self._apply_config_changes()
+
         if self.tick_count % FOCUS_POLL_TICKS == 0:
             self._poll_focus()        # which window is focused
             self._poll_focus_session()  # whether the user is in a focus block
+
+        if self.tick_count % FULLSCREEN_CHECK_TICKS == 0:
+            self._check_fullscreen()
 
         if self.tick_count % CONTEXT_CHECK_INTERVAL == 0:
             self._check_window_context()
@@ -1226,6 +1582,7 @@ class DesktopPet(QWidget):
         # showing.
         if self.awaiting_ai and self.tick_count > self.ai_deadline:
             self.awaiting_ai = False
+            self._ai_timed_out = True
             if self.speech_timer == 0:
                 self.speak(get_system_status_quote(self.current_skin))
 
@@ -1237,7 +1594,7 @@ class DesktopPet(QWidget):
         if self.heart_timer > 0:
             self.heart_timer -= 1
 
-        if not self.dragging:
+        if not self.dragging and not self._hidden_for_fullscreen:
             self._update_fsm(cursor)
             self.maybe_screenshot()
 
@@ -1246,6 +1603,49 @@ class DesktopPet(QWidget):
 
         self._sync_widget_geometry()
         self.update()
+
+    # =================================================================
+    # Environment awareness
+    # =================================================================
+
+    def _apply_config_changes(self):
+        """Pick up edits to companion_config.json without a restart."""
+        try:
+            if not ai_companion.reload_config_if_changed():
+                return
+        except Exception:
+            return
+        if self.tracker is not None:
+            try:
+                self.tracker.set_ignored_windows(
+                    self._behaviour().get("ignore_windows", []))
+            except Exception:
+                log_exception("config: ignore list")
+        self._apply_click_through()
+        self._refresh_screen_geometry()
+
+    def _check_fullscreen(self):
+        """Get out of the way of a fullscreen window.
+
+        Cutscenes, games, presentations and video full-screen windows are
+        exactly where a floating pet is least welcome -- and where it used to
+        sit on top of the titlebar ledge it cannot even see.
+        """
+        if self.tracker is None:
+            return
+        wanted = bool(self._behaviour().get("hide_on_fullscreen", True))
+        try:
+            fullscreen = bool(self.tracker.fullscreen_active()) and wanted
+        except Exception:
+            return
+        if fullscreen == self._hidden_for_fullscreen:
+            return
+        self._hidden_for_fullscreen = fullscreen
+        if fullscreen:
+            self.hide()
+        else:
+            self._restack_on_top(force=True)
+
 
     # =================================================================
     # Finite state machine
@@ -1286,11 +1686,25 @@ class DesktopPet(QWidget):
             self.y_pos += (hover - self.y_pos) * 0.15
         elif not self._is_on_ledge():
             self.y_pos = self.floor_y
+        elif not self._validate_current_ledge():
+            # The titlebar the pet is standing on closed (or was renamed)
+            # while it idled, walked, groomed or slept on it. This validation
+            # only ran from PERCH, so every other state kept the pet floating
+            # at the vanished window's height until something else moved it.
+            self._leave_ledge()
+            return
 
         # Horizontal bounds of the current screen, honouring its origin.
         low = float(self.screen_left)
         high = float(self.screen_left + self.screen_w - self.sprite_w)
         self.x_pos = max(low, min(high, self.x_pos))
+
+        # Nobody has touched the machine in a while: settle down and nap until
+        # they come back. Cheap (one cached number) and it stops the pet from
+        # walking around an empty screen all night.
+        if self._should_nap_while_idle():
+            self._enter_state("SLEEP")
+            return
 
         if self.state in ("SIT", "IDLE"):
             self._tick_idle(cursor_dx, cursor_dist)
@@ -1313,10 +1727,52 @@ class DesktopPet(QWidget):
                 self.energy = min(100.0, self.energy + 8)
                 self._enter_sit()
         elif self.state == "SLEEP":
-            if (self.state_timer > STATE_MAX_DURATION.get("SLEEP", 300)
-                    or cursor_dist < 30):
+            still_away = self._user_idle_seconds()
+            threshold = self._idle_sleep_seconds()
+            still_away = (threshold > 0 and still_away is not None
+                          and still_away >= threshold)
+            if not still_away and (self.state_timer > STATE_MAX_DURATION.get("SLEEP", 300)
+                                   or cursor_dist < 30):
                 self.energy = min(100.0, self.energy + ENERGY_GAIN_WAKE)
                 self._enter_sit()
+
+    # ---- being alone ---------------------------------------------------
+
+    def _idle_sleep_seconds(self):
+        """How long the user has to be away before the pet naps. 0 = never."""
+        try:
+            return float(self._behaviour().get("sleep_when_idle_seconds", 300))
+        except (TypeError, ValueError):
+            return 300.0
+
+    def _user_idle_seconds(self):
+        """Seconds since the user last touched anything, or None.
+
+        Prefers the OS's own answer (XScreenSaver / GetLastInputInfo, via the
+        tracker) and falls back to the pet's own cursor-activity signal, which
+        needs no platform support at all.
+        """
+        seconds = None
+        if self.tracker is not None:
+            try:
+                seconds = self.tracker.user_idle_seconds()
+            except Exception:
+                seconds = None
+        if seconds is None:
+            seconds = (self.tick_count - self.last_activity_tick) / TICKS_PER_SECOND
+        return seconds
+
+    def _should_nap_while_idle(self):
+        threshold = self._idle_sleep_seconds()
+        if threshold <= 0:
+            return False
+        if self.state == "SLEEP":
+            return False
+        if self.state not in ("SIT", "IDLE", "BLINK", "GROOM", "WALK", "STALK",
+                              "SWAT", "CHASE", "RUN"):
+            return False
+        idle = self._user_idle_seconds()
+        return idle is not None and idle >= threshold
 
     def _tick_idle(self, cursor_dx, cursor_dist):
         key = self.state
@@ -2080,26 +2536,37 @@ class DesktopPet(QWidget):
         target = event.globalPos() - self.drag_offset
         if (target - self.pos()).manhattanLength() > 4:
             self.dragging = True
-        # Clamp into the desktop: an unclamped drag could leave the pet at
-        # y=-5000, which is a twenty second fall.
-        self.x_pos = float(max(0, min(target.x(), self._desktop_right())))
+        # Clamp into the *virtual desktop*: an unclamped drag could leave the
+        # pet at y=-5000, which is a twenty second fall. The old clamp used
+        # max(0, ...) and QDesktopWidget, so a monitor left of or above the
+        # primary one was off limits.
+        left, top, right, bottom = self._virtual_desktop_rect()
         bubble_h = self.speech_bubble_h if self.speech_text else 0
-        top = self.screen_top - bubble_h
-        self.y_pos = float(max(top, min(target.y() + bubble_h, self._desktop_bottom())))
+        self.x_pos = float(max(left, min(target.x(), right - self.sprite_w)))
+        self.y_pos = float(max(top - bubble_h,
+                               min(target.y() + bubble_h, bottom - self.sprite_h)))
         self._sync_widget_geometry()
         self.last_activity_tick = self.tick_count
 
+    def _virtual_desktop_rect(self):
+        """Union of every connected screen, in Qt logical pixels."""
+        app = QApplication.instance()
+        screens = app.screens() if app is not None else []
+        if not screens:
+            return (self.screen_left, self.screen_top,
+                    self.screen_left + self.screen_w,
+                    self.screen_top + self.screen_h)
+        left = min(s.geometry().x() for s in screens)
+        top = min(s.geometry().y() for s in screens)
+        right = max(s.geometry().x() + s.geometry().width() for s in screens)
+        bottom = max(s.geometry().y() + s.geometry().height() for s in screens)
+        return (left, top, right, bottom)
+
     def _desktop_right(self):
-        try:
-            return QApplication.instance().desktop().width()
-        except Exception:
-            return self.screen_left + self.screen_w
+        return self._virtual_desktop_rect()[2]
 
     def _desktop_bottom(self):
-        try:
-            return QApplication.instance().desktop().height()
-        except Exception:
-            return self.screen_top + self.screen_h
+        return self._virtual_desktop_rect()[3]
 
     @guarded
     def mouseReleaseEvent(self, event):
@@ -2141,7 +2608,28 @@ class DesktopPet(QWidget):
 
     @guarded
     def contextMenuEvent(self, event):
-        menu = QMenu(self)
+        menu = self._build_menu()
+        # The capture cannot happen from inside the menu action: the QMenu is
+        # still on screen, so the model would describe the pet's own menu.
+        # _menu_look only sets the flag; the capture waits for the menu to go.
+        menu.exec_(event.globalPos())
+        if self._pending_capture:
+            self._pending_capture = False
+            QTimer.singleShot(MENU_CLOSE_DELAY_MS, self._run_pending_capture)
+
+    def _build_menu(self, menu=None):
+        """The whole context menu.
+
+        Built here rather than in contextMenuEvent so the tray icon can offer
+        exactly the same menu -- which is the only way to reach the pet when
+        click-through mode is on. Pass an existing `menu` to repopulate it in
+        place; the tray does that on aboutToShow so the checkmarks are never
+        stale.
+        """
+        if menu is None:
+            menu = QMenu(self)
+        else:
+            menu.clear()
 
         skin_menu = menu.addMenu("Switch Companion")
         for name in discover_skins() or self.available_skins:
@@ -2163,9 +2651,11 @@ class DesktopPet(QWidget):
 
         self._add_toggle(menu, "Climb Windows", self.climb_enabled, self._set_climb)
         self._add_toggle(menu, "Allow Jumping", self.allow_jump,
-                         lambda checked: setattr(self, "allow_jump", bool(checked)))
+                         lambda checked: self._set_movement_flag("allow_jump", checked))
         self._add_toggle(menu, "Allow Chasing", self.allow_chase,
-                         lambda checked: setattr(self, "allow_chase", bool(checked)))
+                         lambda checked: self._set_movement_flag("allow_chase", checked))
+        self._add_toggle(menu, "Click Through", self.click_through,
+                         self._set_click_through)
         if self.focus.configured():
             focus_action = QAction("Focus Timer (%s)" % self.focus.describe(), self)
             focus_action.setEnabled(False)
@@ -2175,10 +2665,12 @@ class DesktopPet(QWidget):
         speak_action.triggered.connect(self._menu_speak)
         menu.addAction(speak_action)
 
-        look_action = QAction("Look At This", self)
-        look_action.setToolTip("Capture the screen once and comment on it")
-        look_action.triggered.connect(self._menu_look)
-        menu.addAction(look_action)
+        treat_action = QAction("Give a Treat", self)
+        treat_action.setToolTip("A snack: it perks the pet up")
+        treat_action.triggered.connect(self._menu_treat)
+        menu.addAction(treat_action)
+
+        self._build_privacy_menu(menu)
 
         personality_action = QAction("Edit Personality...", self)
         personality_action.triggered.connect(self._menu_edit_personality)
@@ -2199,6 +2691,10 @@ class DesktopPet(QWidget):
         menu.addAction(forget_action)
 
         menu.addSeparator()
+        stats = QAction(self._stats_text(), self)
+        stats.setEnabled(False)
+        menu.addAction(stats)
+
         status = QAction(self._status_text(), self)
         status.setEnabled(False)
         menu.addAction(status)
@@ -2211,14 +2707,145 @@ class DesktopPet(QWidget):
         quit_action = QAction("Exit", self)
         quit_action.triggered.connect(self.shutdown)
         menu.addAction(quit_action)
+        return menu
 
-        # The capture cannot happen from inside the menu action: the QMenu is
-        # still on screen, so the model would describe the pet's own menu.
-        # _menu_look only sets the flag; the capture waits for the menu to go.
-        menu.exec_(event.globalPos())
-        if self._pending_capture:
-            self._pending_capture = False
-            QTimer.singleShot(MENU_CLOSE_DELAY_MS, self._run_pending_capture)
+    def _build_privacy_menu(self, menu):
+        """Screens this pet is allowed to look at, and what happens to them."""
+        privacy = menu.addMenu("Screenshots && Privacy")
+        settings = ai_companion.screenshot_settings()
+
+        self._add_toggle(privacy, "Look At My Screen", settings.get("enabled", False),
+                         self._set_screenshots_enabled)
+
+        look_action = QAction("Look At This", self)
+        look_action.setToolTip("Capture the screen once and comment on it")
+        look_action.triggered.connect(self._menu_look)
+        privacy.addAction(look_action)
+
+        privacy.addSeparator()
+
+        block_action = QAction("Never Capture This App", self)
+        block_action.setToolTip("Blocklist the focused application, by process name")
+        block_action.triggered.connect(self._menu_block_current_app)
+        privacy.addAction(block_action)
+
+        edit_action = QAction("Edit Blocklist...", self)
+        edit_action.setToolTip("Process and title rules that are never captured")
+        edit_action.triggered.connect(self._menu_edit_blocklist)
+        privacy.addAction(edit_action)
+
+        ocr_cfg = ai_companion.ocr_settings()
+        self._add_toggle(privacy, "OCR Content Filter", ocr_cfg.get("enabled", True),
+                         self._set_ocr_enabled)
+
+        filter_action = QAction("Filter: %s" % self._ocr_description(), self)
+        filter_action.setEnabled(False)
+        privacy.addAction(filter_action)
+
+        status = QAction(ai_companion.screenshots_status_text(), self)
+        status.setEnabled(False)
+        privacy.addAction(status)
+
+        log_action = QAction("What Happened To My Screens...", self)
+        log_action.triggered.connect(self._menu_capture_log)
+        privacy.addAction(log_action)
+
+    def _ocr_description(self):
+        if ocr_guard is None:
+            return "unavailable"
+        try:
+            return ocr_guard.describe(ai_companion.ocr_settings())
+        except Exception:
+            return "unavailable"
+
+    # ---- privacy actions -----------------------------------------------
+
+    def _set_screenshots_enabled(self, checked):
+        ai_companion.CONFIG.setdefault("screenshots", {})["enabled"] = bool(checked)
+        ai_companion.save_config()
+        if checked:
+            self._speak_contextual("happy")
+        else:
+            self.speak("ok, no more looking.")
+
+    def _set_ocr_enabled(self, checked):
+        ocr = ai_companion.CONFIG.setdefault("screenshots", {}).setdefault("ocr", {})
+        ocr["enabled"] = bool(checked)
+        ai_companion.save_config()
+        self.speak("filter %s." % ("on" if checked else "off"))
+
+    def _menu_block_current_app(self):
+        """One click: the app in front of me is never captured again."""
+        window = self._focused_window()
+        if window is None:
+            self.speak("nothing focused to block.")
+            return
+        process = (window.process or "").strip()
+        title = (window.title or "").strip()
+        if process:
+            entry = "proc:%s" % process
+            added = ai_companion.add_blocklist_entry(entry)
+            self.speak("%s %s." % ("blocked" if added else "already blocked",
+                                   process))
+            return
+        # No process name (some X11 clients do not set _NET_WM_PID): fall back
+        # to a title rule, which still keeps the window itself out.
+        if title:
+            entry = "title:%s" % title[:60]
+            added = ai_companion.add_blocklist_entry(entry)
+            self.speak("%s that window." % ("blocked" if added else "already blocked"))
+            return
+        self.speak("can't tell what that app is.")
+
+    def _focused_window(self):
+        """The focused window, refreshing the tracker if there is time."""
+        if self.tracker is None:
+            return None
+        try:
+            self.tracker.get_windows(force_refresh=True)
+            return self.tracker.get_active_window()
+        except Exception:
+            return None
+
+    def _menu_edit_blocklist(self):
+        from PyQt5.QtWidgets import QInputDialog
+
+        current = ", ".join(ai_companion.blocklist())
+        text, ok = QInputDialog.getText(
+            self, "Screenshot blocklist",
+            "Comma-separated rules the pet must never send:\n"
+            "  proc:vscode      exact process name (proc:foo* for a prefix)\n"
+            "  pid:1234         one process id\n"
+            "  title:inbox      window-title fragment\n"
+            "  re:^secret\\s     window-title regex\n"
+            "  fragment         any title or process containing it",
+            text=current)
+        if not ok:
+            return
+        entries = [part.strip() for part in text.split(",") if part.strip()]
+        if ai_companion.set_blocklist(entries):
+            self.speak("blocklist saved.")
+        else:
+            self.speak("i couldn't save that.")
+
+    def _menu_capture_log(self):
+        from PyQt5.QtWidgets import QMessageBox
+
+        decisions = ai_companion.capture_decisions(12)
+        if not decisions:
+            body = "Nothing has been captured this session."
+        else:
+            lines = []
+            for entry in decisions:
+                when = time.strftime("%H:%M:%S", time.localtime(entry["at"]))
+                reason = (" - %s" % entry["reason"]) if entry["reason"] else ""
+                lines.append("%s  %s%s" % (when, entry["action"], reason))
+            body = "\n".join(lines)
+        box = QMessageBox(self)
+        box.setWindowTitle("Screen capture log")
+        box.setText("Recent captures (nothing here contains screen content)")
+        box.setDetailedText(body)
+        box.exec_()
 
     def _add_toggle(self, menu, label, checked, handler):
         action = QAction(label, self)
@@ -2228,7 +2855,71 @@ class DesktopPet(QWidget):
         menu.addAction(action)
         return action
 
-    # ---- menu actions --------------------------------------------------
+    def _stats_text(self):
+        """One line of "what has this pet done", from the saved state."""
+        data = self.state_store.data if self.state_store is not None else {}
+        alive = 0.0
+        if self.state_store is not None:
+            try:
+                alive = self.state_store.total_seconds_alive(
+                    time.time() - self.session_start)
+            except Exception:
+                alive = 0.0
+        hours, remainder = divmod(int(alive), 3600)
+        minutes = remainder // 60
+        age = ("%dh %02dm" % (hours, minutes)) if hours else "%dm" % minutes
+        pets = 0
+        if self.interaction is not None:
+            pets = len(getattr(self.interaction, "pets", []) or [])
+        return "alive %s - %d sessions - %d pets - %d treats" % (
+            age, data.get("pet_count", 0) or 0, pets,
+            data.get("treats_given", 0) or 0)
+
+    def _menu_treat(self):
+        """A snack: energy, a heart, and a line."""
+        if self.tick_count < self._treat_until_tick:
+            self.speak("i'm still chewing.")
+            return
+        self._treat_until_tick = self.tick_count + 20 * 30   # 30s
+        self.energy = min(100.0, self.energy + 25.0)
+        self.heart_timer = 25
+        self.petted_until_tick = self.tick_count
+        if self.state_store is not None:
+            current = self.state_store.data.get("treats_given", 0) or 0
+            self.state_store.touch(treats_given=int(current) + 1)
+            self.state_store.save(force=True)
+        self._speak_contextual("happy")
+
+    def _set_movement_flag(self, name, checked):
+        """Menu toggles that now survive a restart (they used to be memory-only)."""
+        setattr(self, name, bool(checked))
+        self._save_state(force=True)
+
+    def _set_climb(self, checked):
+        self.climb_enabled = bool(checked)
+        self._save_state(force=True)
+
+    def _set_click_through(self, checked):
+        """Let clicks fall through the pet to whatever is underneath."""
+        self.click_through = bool(checked)
+        self._apply_click_through()
+        if self.click_through:
+            self.speak("click-through on. use the tray icon." if self.tray
+                       else "click-through on. use the menu again to undo.")
+        self._save_state(force=True)
+
+    def _apply_click_through(self):
+        """Keep the window flag in sync with `self.click_through`."""
+        try:
+            flags = (Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+            if self.click_through:
+                flags |= Qt.WindowTransparentForInput
+            if self.windowFlags() != flags:
+                self.setWindowFlags(flags)
+                self.show()
+                self.raise_()
+        except Exception:
+            log_exception("click-through")
 
     def _menu_look(self):
         """Queue a one-off capture. See contextMenuEvent for the delay."""
@@ -2310,9 +3001,6 @@ class DesktopPet(QWidget):
         ai_companion.reset_failures()
         self._speak_contextual("idle")
 
-    def _set_climb(self, checked):
-        self.climb_enabled = bool(checked)
-
     def _menu_speak(self):
         self.heart_timer = 20
         self.request_dialogue(user_initiated=True)
@@ -2340,11 +3028,72 @@ class DesktopPet(QWidget):
         self._enter_sit()
         self._sync_widget_geometry()
 
+    def setup_tray(self):
+        """A tray icon with the same menu.
+
+        Two jobs: it is the way back out of click-through mode, and it is the
+        way to reach the pet at all when it is hidden behind a fullscreen app.
+        """
+        if QSystemTrayIcon is None or self.tray is not None:
+            return None
+        try:
+            if not QSystemTrayIcon.isSystemTrayAvailable():
+                return None
+            icon = self._tray_icon()
+            tray = QSystemTrayIcon(icon, self)
+            tray.setToolTip("Desktop Pet")
+            tray_menu = QMenu(self)
+            # Rebuild on open: the toggles in this menu reflect live state, and
+            # a menu built once at startup would show the values it started
+            # with.
+            tray_menu.aboutToShow.connect(
+                functools.partial(self._repopulate_tray_menu, tray_menu))
+            self._repopulate_tray_menu(tray_menu)
+            tray.setContextMenu(tray_menu)
+            tray.activated.connect(self._on_tray_activated)
+            tray.show()
+            self.tray = tray
+            self.tray_menu = tray_menu
+            return tray
+        except Exception:
+            log_exception("tray")
+            self.tray = None
+            return None
+
+    @guarded
+    def _repopulate_tray_menu(self, menu=None):
+        self._build_menu(menu if menu is not None else getattr(self, "tray_menu", None))
+
+    def _tray_icon(self):
+        """Use the pet's own first sprite as the tray icon if we can."""
+        try:
+            frames = self._frame_table.get("SIT") or []
+            if frames:
+                return QIcon(frames[0])
+            for frames in self.sprites.values():
+                if frames:
+                    return QIcon(frames[0])
+        except Exception:
+            pass
+        return QIcon()
+
+    @guarded
+    def _on_tray_activated(self, reason):
+        if QSystemTrayIcon is not None and reason == QSystemTrayIcon.Trigger:
+            self._restack_on_top(force=True)
+
     def shutdown(self):
         """Stop the poller, save state, and quit cleanly."""
         try:
             self.timer.stop()
             self._save_state(force=True)
+            if self.tray is not None:
+                try:
+                    self.tray.hide()
+                except Exception:
+                    pass
+                self.tray = None
+                self.tray_menu = None
             if self.tracker is not None:
                 self.tracker.stop_background()
         except Exception:
@@ -2423,11 +3172,13 @@ def main():
     app.setQuitOnLastWindowClosed(False)
     app.setApplicationName(PET_WINDOW_TITLE)
     _pick_speech_font()
+    rotate_log()
 
     skins = discover_skins()
     start_skin = "cat" if "cat" in skins else (skins[0] if skins else "cat")
     pet = DesktopPet(skin=start_skin, scale=2)
     pet._install_signal_handlers()
+    pet.setup_tray()
 
     try:
         return app.exec_()

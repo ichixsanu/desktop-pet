@@ -12,6 +12,11 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
+Optional but recommended: install `tesseract` with your system package manager
+(`apt install tesseract-ocr`, `pacman -S tesseract`, `brew install tesseract`).
+It powers the OCR content filter described under **Screenshots** below. Without
+it, captures are refused rather than sent unfiltered.
+
 Edit `.env`:
 
 ```
@@ -48,21 +53,31 @@ lines — nothing breaks.
 
 ## Configuring the companion
 
-All behavior tuning lives in `companion_config.json` (plain JSON, edit and
-restart):
+All behavior tuning lives in `companion_config.json` (plain JSON). **Edits are
+picked up while the pet is running** — at most five seconds after you save, so
+turning screenshots off actually turns them off in the process you already have
+open:
 
 - `ai_enabled` — master on/off switch.
 - `companions.<skin>.system_prompt` — personality per companion. Falls back to
   `default_system_prompt` if a skin doesn't have its own. Nested keys merge, so
   you can override one value without restating its neighbours.
-- `rate_limits` — minimum seconds between lines and a max-per-hour cap, separate
-  for idle chatter (`idle`) vs screenshot commentary (`screenshot`). A slot is
-  only charged when a line actually comes back.
+- `rate_limits` — minimum seconds between lines and a max-per-hour cap, tracked
+  separately for idle chatter (`idle`), screenshot commentary (`screenshot`) and
+  things you asked for yourself (`user`, i.e. **Speak**, petting, **Give a
+  Treat**). A slot is only charged when a line actually comes back. The `user`
+  pool is deliberately its own: background chatter must never be able to make
+  the Talk-to-me button do nothing.
 - `screenshots` — see below.
 - `memory` — see below.
+- `state` — saved session, including `energy_decay_per_hour`.
+- `behaviour` — `ignore_windows`, `allow_jump`, `allow_chase`,
+  `ai_context_lines`, `hide_on_fullscreen`, `sleep_when_idle_seconds`,
+  `quiet_hours` (see **Keeping out of the way** below).
 
 Secrets (`MODEL`, API keys) stay in `.env`. Everything else is in the JSON so
 you're not hunting through code to change a personality or a rate limit.
+
 
 Companion voice lives in exactly one place, `companion_dialogue.py`: window
 reactions, time-of-day lines, petting, drops, climbs, perching, low memory, low
@@ -81,9 +96,15 @@ screen and asks the model for one short in-character reaction. It only fires:
 - and still counts against the normal `rate_limits.screenshot` cap.
 
 The whole policy is checked *before* any pixels are grabbed, so a refused or
-rate-limited request costs nothing. The grab happens on the GUI thread (Qt
-requires it); redaction, JPEG encoding and the API call happen on a worker
-thread, so the pet keeps animating.
+rate-limited request costs nothing. Turning `screenshots.enabled` off is a hard
+gate, not a preference: an automatic capture cannot happen while it is off, no
+matter what else the timer or the window tracker are doing. Manual captures
+(**Look At This** / **Look At My Screen**) are the one exception, because you
+asked for them.
+
+The grab happens on the GUI thread (Qt requires it); redaction, the OCR pass,
+JPEG encoding and the API call happen on a worker thread, so the pet keeps
+animating.
 
 **This is off by default on purpose.** Turning it on means screenshots of your
 desktop get sent to Groq's API. Read the privacy section below before enabling
@@ -91,11 +112,23 @@ it.
 
 ### Privacy / blocklist
 
-`screenshots.blocklist` is a list of process names or window-title substrings
-(case-insensitive, partial match) — e.g. `"keepass"`, `"signal"`, `"bank"`,
-`"incognito"`. Before every capture:
+`screenshots.blocklist` is a list of matchers, case-insensitive. A plain entry
+like `"keepass"` is a substring match against the window title *or* the process
+name. Prefixes make a rule specific:
 
-1. If the **foreground window** matches the blocklist, the capture is skipped
+| entry | matches |
+|-------|---------|
+| `keepass` | process name or title contains "keepass" (the old behaviour) |
+| `proc:keepassxc` | the process name is `keepassxc` (or `keepassxc.exe`) |
+| `proc:code*` | process name starts with `code` |
+| `pid:4242` | that exact process id |
+| `title:Inbox` | the window title only |
+| `re:^\(\d+\)` | a regular expression against the title (or `regex:`) |
+
+`proc:` is the precise one — a browser tab titled "keepassxc" is not the vault.
+Before every capture:
+
+1. If the **focused window** matches the blocklist, the capture is skipped
    entirely — nothing is grabbed, nothing is sent.
 2. Every other visible window that matches is blacked out in the captured image
    before it's sent, even if it's just sitting open in the background.
@@ -113,6 +146,76 @@ redacted — not recommended.
 
 Redaction rectangles are translated into the grabbed screen's coordinate space,
 so a second monitor does not shift them off target.
+
+**Never Capture This App** in the menu adds a `proc:` rule for whatever is
+focused right now (falling back to `title:` when the process name is not
+available), which is usually easier than typing it. **Edit Blocklist...** shows
+the whole list, one entry per line.
+
+### OCR content filter
+
+Redaction only knows about windows you told it about. The OCR filter is the
+second line of defence: the redacted image is run through a local OCR pass, and
+if the text on screen looks like credentials, the image is discarded before
+anything is sent. Nothing about that text leaves the machine — the decision is
+made locally and only a verdict travels.
+
+```json
+"ocr": {
+  "enabled": true,
+  "engine": "auto",
+  "fail_closed": true,
+  "max_width": 1600,
+  "timeout_seconds": 6,
+  "languages": "eng",
+  "psm": 3,
+  "extra_keywords": [],
+  "allowed_keywords": []
+}
+```
+
+What it looks for:
+
+- **Strong keywords** — `seed phrase`, `private key`, `api key`, `card number`,
+  `recovery code`, …
+- **Fields with values** — `password: hunter2`, `token = "…"`. A line that only
+  *names* a secret is not flagged: `password = os.environ["PASSWORD"]`,
+  `${DB_PASSWORD}`, `api_key: <your key here>` and `secret: null` are how code
+  and config templates look, and blocking those would cost you every editor
+  screenshot you wanted.
+- **Secret shapes** — OpenAI/Groq/GitHub/Anthropic/Slack/AWS keys, JWTs, bearer
+  tokens, PEM private-key blocks.
+- **Checksummed numbers** — card numbers (Luhn) and IBANs (mod-97), so a build
+  id that merely looks like a 16-digit number is not a card number.
+- `extra_keywords` adds your own; `allowed_keywords` exempts a line (say
+  `"docs/security.md"` in a tutorial) from the keyword rules. It never exempts a
+  real key or card number.
+
+`fail_closed: true` means "if the scan could not run, refuse the capture" — a
+screen full of text that we failed to read is not known to be clean. Turn it off
+if you would rather capture anyway, and unset `enabled` to skip the filter.
+
+The filter needs the `tesseract` binary (`sudo pacman -S tesseract` /
+`apt install tesseract-ocr`); it is not a Python package. Without it, and with
+`fail_closed: true`, captures are refused and `pet.log` says why. The
+**OCR Content Filter** menu item toggles it and shows the current engine and
+rule count.
+
+### What happened to my screenshots?
+
+**What Happened To My Screens...** opens the capture decision log: the last
+`screenshots.capture_log_size` (default 20) decisions, newest first, each with
+whether the image was `sent`, `discarded`, `refused` or `failed` — and the
+reason, e.g. `sensitive text on screen (card number, password field)` or
+`focused window matches the blocklist`. The reasons name rules, never the text
+that matched.
+
+### Always on top
+
+The pet sets `WindowStaysOnTopHint` at startup, and re-applies its window flags
+and raises itself after anything that might have re-stacked it — in particular
+the hide/show dance used to keep the pet out of its own manual capture. You
+should never have to hunt for it behind another window.
 
 ## Memory
 
@@ -202,6 +305,25 @@ windows are never stood on or climbed, but they are still *visible* to the app �
 screenshot redaction has to account for exactly the windows the pet is ignoring.
 **Ignore Windows...** in the menu edits the list and saves it.
 
+## Keeping out of the way
+
+Three `behaviour` settings decide when the pet stays quiet, all optional:
+
+- `hide_on_fullscreen` (default `true`) — hides while a fullscreen window is
+  focused (a film, a game, a slideshow) and comes back when it isn't. It still
+  checks once a second, so it is off your screen but not asleep.
+- `sleep_when_idle_seconds` (default `300`) — after this long with no keyboard
+  or mouse input, the pet naps and stops wandering an empty screen. It wakes on
+  your next input. `0` disables it.
+- `quiet_hours` — `{"enabled": true, "start": "23:00", "end": "07:00"}`
+  (windows that cross midnight work) suppresses idle chatter and window
+  comments. Lines you asked for still happen: quiet hours mean "don't
+  interrupt", not "don't speak".
+
+`ai_context_lines` (default `true`) controls whether idle window comments may
+use the model. Off means the pet still reacts to your windows, just from the
+built-in canned lines — no tokens, no network.
+
 ## Changing a personality without editing JSON
 
 **Edit Personality...** opens a box with the current companion's instructions —
@@ -222,21 +344,39 @@ boundary.
 
 - **Switch Companion** — cat, shiba, ghost, jarvis, ultron.
 - **Scale** — 1x to 4x.
-- **Climb Windows**, **Allow Jumping**, **Allow Chasing** — behaviour toggles.
+- **Climb Windows**, **Allow Jumping**, **Allow Chasing**, **Click Through** —
+  behaviour toggles. Click-through makes the pet ignore the mouse entirely
+  (handy on a busy screen); the tray icon still offers the full menu, which is
+  the way back out. All four remember your choice.
+- **Focus Timer** — enable/disable reading the focus file without editing JSON.
 - **Speak** — ask for a line now.
-- **Look At This** — capture the screen once and comment on it. Works even when
-  the automatic screenshot feature is off, and still refuses whenever the
-  blocklist or the Wayland guarantee says so. Privacy is not a quota.
+- **Give a Treat** — a small energy top-up, on a cooldown.
+- **Screenshots && Privacy** — the whole capture policy in one submenu:
+  - **Look At My Screen** — turn automatic captures on/off.
+  - **Look At This** — capture the screen once and comment on it. Works even
+    when the automatic feature is off, still refuses whenever the blocklist,
+    the Wayland guarantee or the OCR filter says so. Privacy is not a quota.
+  - **Never Capture This App** — blocklist whatever is focused right now.
+  - **Edit Blocklist...** — the raw rule list.
+  - **OCR Content Filter** — toggle the filter (the item below it shows the
+    engine, rule count and fail mode).
+  - a status line, and **What Happened To My Screens...**.
 - **Edit Personality...** — rewrite this companion's instructions in a dialog.
 - **Ignore Windows...** — windows the pet must not stand on.
 - **Reset Position** — back to the middle of the floor.
 - **Forget Me** — delete the saved session.
 - A status line showing whether AI is on, and **Retry AI** if it is configured
-  but failing.
+  but failing. Below it, a small stats line (time alive, sessions, pets,
+  treats).
 - **Exit**.
 
+The same menu is on the tray icon, rebuilt each time it opens so the
+checkmarks and status text are never stale.
+
 Left-click and release without dragging = pet it (in-character reply if AI is
-available, canned line otherwise).
+available, canned line otherwise). If the model is rate-limited, slow or
+unreachable, the canned line happens instead — the pet never just stands there
+because a request is in flight.
 
 ## Tests
 
@@ -244,12 +384,15 @@ available, canned line otherwise).
 python3 -m unittest discover -p 'test_*.py'
 ```
 
-239 tests, no third-party test runner needed. They cover the window-tracker's
+372 tests, no third-party test runner needed. They cover the window-tracker's
 geometry, caching, HiDPI conversion, Wayland trust rules and ignore list; the
-model's result contract, rate limiting, key rotation and `MEMORY:` parsing;
-redaction and the refusal rules; persistence and the focus file; and the pet's
-FSM invariants — never `PERCH` without a ledge, never walk off a titlebar,
-climbs finish, drag clamping, bubble layout, mood and energy behaviour, and a
+model's result contract, rate limiting, key rotation, `MEMORY:` parsing and
+config hot-reload; redaction, the blocklist prefixes and the refusal rules; the
+OCR filter including its own false-positive rules and its fail-closed
+behaviour; persistence, the focus file and the lifetime counter; and the pet's
+FSM invariants — never `PERCH` without a ledge, never walk off a titlebar, never
+stand on a window that closed, climbs finish, drag clamping, bubble layout,
+mood and energy behaviour, quiet hours, the idle nap, fullscreen hiding, and a
 6000-tick randomised run that asserts every invariant on every single tick.
 
 ## Troubleshooting
@@ -289,8 +432,15 @@ then `systemctl --user enable --now desktop-pet`.
 
 ## Notes
 
-- Sprites are regenerated by `build_pet.py` in the parent project if you ever
-  want to tweak the pixel art code itself — this folder is the built output.
-  Drop a new skin in as `skins/<name>/` with any subset of `sit_0.png`,
-  `walk_0.png`, `sleep_0.png` and it appears in the menu on next launch; missing
-  states fall back gracefully.
+- Sprites are plain PNGs under `skins/<name>/`; drop a new skin in as
+  `skins/<name>/` with any subset of `sit_0.png`, `walk_0.png`, `sleep_0.png`
+  and it appears in the menu on next launch; missing states fall back
+  gracefully. `generate_sprites.py` regenerates them from the sprite modules
+  (`sprites_cat.py`, ...). Those modules are a work in progress: `--check`
+  validates what exists and tells you which module is still missing its
+  `frames()` instead of crashing, and it writes nothing until a module passes.
+- State that is private stays private: `pet_state.json`,
+  `companion_memory.json` and the capture log are written with `0600`
+  permissions, and `.env` should be too (`chmod 600 .env`).
+- `pet.log` rotates to `pet.log.1` when it grows past `pet.LOG_MAX_BYTES`, so a
+  long-lived pet cannot fill a disk.

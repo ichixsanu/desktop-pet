@@ -43,6 +43,7 @@ class TempPaths(unittest.TestCase):
         ai.reset_failures()
         ai._sent_log["idle"].clear()
         ai._sent_log["screenshot"].clear()
+        ai._sent_log.setdefault("user", []).clear()
         ai._daily.update({"date": "", "count": 0})
         ai._last_capture = 0.0
         ai._state["key_idx"] = 0
@@ -51,6 +52,7 @@ class TempPaths(unittest.TestCase):
         ai.reset_failures()
         ai._sent_log["idle"].clear()
         ai._sent_log["screenshot"].clear()
+        ai._sent_log.setdefault("user", []).clear()
         ai._daily.update({"date": "", "count": 0})
         ai._last_capture = 0.0
         ai._state["token_budget"] = ai.MIN_TOKEN_BUDGET
@@ -474,6 +476,176 @@ class TestStatusReporting(TempPaths):
                     status = ai.ai_status()
         self.assertTrue(status["enabled"])
         self.assertIn("key", status["reason"])
+
+
+class TestConfigHotReload(TempPaths):
+    """Editing companion_config.json used to require a restart.
+
+    Which meant "I turned screenshots off" was a lie until the next launch:
+    the running process kept using the values it loaded at import.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.reset_state()
+        self.config_path = os.path.join(self.tmp.name, "config.json")
+        with open(self.config_path, "w") as handle:
+            json.dump({"screenshots": {"enabled": False}}, handle)
+        self._saved_path = ai.CONFIG_PATH
+        ai.CONFIG_PATH = self.config_path
+        self.addCleanup(setattr, ai, "CONFIG_PATH", self._saved_path)
+        ai.CONFIG = ai._load_config()
+        ai._config_stamp = ai._stamp()
+
+    def _write(self, payload):
+        with open(self.config_path, "w") as handle:
+            json.dump(payload, handle)
+        # Same-second edits: the stamp uses nanoseconds, but be explicit.
+        os.utime(self.config_path, (time.time() + 1, time.time() + 1))
+
+    def test_unchanged_file_is_not_reread(self):
+        self.assertFalse(ai.reload_config_if_changed())
+
+    def test_an_edit_is_picked_up_in_place(self):
+        original = ai.CONFIG
+        self.assertFalse(ai.CONFIG["screenshots"]["enabled"])
+        self._write({"screenshots": {"enabled": True, "interval_minutes": 3}})
+        self.assertTrue(ai.reload_config_if_changed())
+        # Same object: anything holding a reference sees the new values, which
+        # is what makes this safe to call while the pet is running.
+        self.assertIs(ai.CONFIG, original)
+        self.assertTrue(ai.screenshot_settings()["enabled"])
+        self.assertEqual(ai.screenshot_settings()["interval_minutes"], 3)
+
+    def test_defaults_survive_a_partial_file(self):
+        self._write({"screenshots": {"enabled": True}})
+        ai.reload_config_if_changed()
+        self.assertIn("blocklist", ai.screenshot_settings())
+        self.assertIn("ocr", ai.screenshot_settings())
+
+    def test_a_deleted_file_does_not_reload(self):
+        os.unlink(self.config_path)
+        self.assertFalse(ai.reload_config_if_changed())
+        self.assertIn("screenshots", ai.CONFIG)
+
+
+class TestPrivacyConfig(TempPaths):
+    def setUp(self):
+        super().setUp()
+        self.reset_state()
+        self.config_path = os.path.join(self.tmp.name, "config.json")
+        with open(self.config_path, "w") as handle:
+            json.dump({}, handle)
+        self._saved_path = ai.CONFIG_PATH
+        ai.CONFIG_PATH = self.config_path
+        self.addCleanup(setattr, ai, "CONFIG_PATH", self._saved_path)
+        ai.CONFIG = ai._load_config()
+        ai._config_stamp = ai._stamp()
+        self.addCleanup(ai._capture_log.clear)
+
+    def test_add_blocklist_entry_dedupes_and_saves(self):
+        self.assertTrue(ai.add_blocklist_entry("proc:keepassxc"))
+        self.assertFalse(ai.add_blocklist_entry("PROC:KeePassXC"))
+        self.assertEqual(ai.blocklist(), ["proc:keepassxc"])
+        with open(self.config_path) as handle:
+            on_disk = json.load(handle)
+        self.assertEqual(on_disk["screenshots"]["blocklist"], ["proc:keepassxc"])
+
+    def test_empty_entries_are_refused(self):
+        self.assertFalse(ai.add_blocklist_entry("   "))
+        self.assertFalse(ai.add_blocklist_entry(None))
+        self.assertEqual(ai.blocklist(), [])
+
+    def test_set_blocklist_replaces_everything(self):
+        ai.set_blocklist(["bank", " proc:signal ", ""])
+        self.assertEqual(ai.blocklist(), ["bank", "proc:signal"])
+
+    def test_capture_log_is_newest_first_and_capped(self):
+        ai.CONFIG["screenshots"]["capture_log_size"] = 3
+        for index in range(5):
+            ai.note_capture_decision("sent" if index % 2 else "discarded",
+                                     "rule %d" % index)
+        entries = ai.capture_decisions(10)
+        self.assertEqual(len(entries), 3)
+        self.assertEqual(entries[0]["reason"], "rule 4")
+        self.assertEqual(ai.last_capture_decision()["reason"], "rule 4")
+
+    def test_status_text_reports_the_gates(self):
+        self.assertIn("off", ai.screenshots_status_text())
+        ai.CONFIG["screenshots"]["enabled"] = True
+        ai.add_blocklist_entry("proc:keepassxc")
+        text = ai.screenshots_status_text()
+        self.assertIn("screenshots on", text)
+        self.assertIn("1 blocklist rule", text)
+        self.assertIn("OCR filter", text)
+        ai.note_capture_decision("refused", "focused window matches the blocklist")
+        self.assertIn("refused", ai.screenshots_status_text())
+
+    def test_ocr_settings_is_always_a_dict(self):
+        self.assertIsInstance(ai.ocr_settings(), dict)
+        ai.CONFIG["screenshots"]["ocr"] = "nonsense"
+        self.assertEqual(ai.ocr_settings(), {})
+
+
+class TestQuotaPools(TempPaths):
+    """The Speak pool must not be starved by the background chatter pool."""
+
+    def setUp(self):
+        super().setUp()
+        self.reset_state()
+        ai.CONFIG = ai._default_config()
+
+    def test_user_pool_is_independent(self):
+        ai.CONFIG["rate_limits"] = {
+            "min_seconds_between": {"idle": 60, "screenshot": 900, "user": 0},
+            "max_per_hour": {"idle": 1, "screenshot": 4, "user": 2},
+        }
+        self.assertTrue(ai._reserve("idle"))
+        self.assertFalse(ai._reserve("idle"), "idle pool not exhausted")
+        # The menu item still works: that is the whole point of the split.
+        self.assertTrue(ai._reserve("user"))
+        self.assertTrue(ai._reserve("user"))
+        self.assertFalse(ai._reserve("user"), "user pool cap ignored")
+        self.assertEqual(len(ai._sent_log["user"]), 2)
+
+    def test_unknown_kind_gets_sane_defaults(self):
+        ai.CONFIG["rate_limits"] = {}
+        self.assertTrue(ai._reserve("something-new"))
+
+    def test_context_line_reports_when_it_cannot_run(self):
+        with patch.object(ai, "_reserve", return_value=False):
+            self.assertFalse(ai.maybe_context_line("cat", "x", lambda *a: None))
+        with patch.object(ai, "ai_enabled", return_value=False):
+            self.assertFalse(ai.maybe_context_line("cat", "x", lambda *a: None))
+
+    def test_context_line_starts_a_request(self):
+        results = []
+        with patch.object(ai, "_call", return_value="a line"):
+            self.assertTrue(ai.maybe_context_line("cat", "window 'x'",
+                                                  lambda t, s: results.append((t, s))))
+            for _ in range(50):
+                if results:
+                    break
+                time.sleep(0.01)
+        self.assertEqual(results, [("a line", ai.STATUS_OK)])
+
+    def test_context_line_carries_no_pixels(self):
+        seen = {}
+
+        def fake_call(messages, max_tokens=0):
+            seen["text"] = json.dumps(messages)
+            return "ok"
+
+        with patch.object(ai, "_call", side_effect=fake_call):
+            ai.maybe_context_line("cat", "window title: 'Notes' (process 'gedit')",
+                                  lambda *a: None)
+            for _ in range(50):
+                if seen:
+                    break
+                time.sleep(0.01)
+        self.assertIn("gedit", seen["text"])
+        self.assertNotIn("data:image", seen["text"])
+        self.assertNotIn("base64", seen["text"])
 
 
 if __name__ == "__main__":

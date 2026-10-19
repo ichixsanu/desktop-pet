@@ -127,8 +127,8 @@ def _default_config():
         ),
         "companions": {},
         "rate_limits": {
-            "min_seconds_between": {"idle": 45, "screenshot": 900},
-            "max_per_hour": {"idle": 6, "screenshot": 4},
+            "min_seconds_between": {"idle": 45, "screenshot": 900, "user": 5},
+            "max_per_hour": {"idle": 6, "screenshot": 4, "user": 60},
         },
         "screenshots": {
             "enabled": False,
@@ -137,6 +137,18 @@ def _default_config():
             "require_recent_activity_minutes": 3,
             "blocklist": [],
             "jpeg_quality": 70,
+            "capture_log_size": 20,
+            "ocr": {
+                "enabled": True,
+                "engine": "auto",
+                "fail_closed": True,
+                "max_width": 1600,
+                "timeout_seconds": 6,
+                "languages": "eng",
+                "psm": 3,
+                "extra_keywords": [],
+                "allowed_keywords": [],
+            },
         },
         "memory": {"enabled": True, "max_facts": 20},
         "state": {"enabled": True, "file": "pet_state.json",
@@ -148,6 +160,10 @@ def _default_config():
             "ignore_windows": [],
             "allow_jump": True,
             "allow_chase": True,
+            "ai_context_lines": True,
+            "hide_on_fullscreen": True,
+            "sleep_when_idle_seconds": 300,
+            "quiet_hours": {"enabled": False, "start": "23:00", "end": "07:00"},
         },
     }
 
@@ -176,6 +192,41 @@ def _load_config():
 
 CONFIG = _load_config()
 
+# mtime+size of the file the live CONFIG was built from. Config edits used to
+# need a restart, which meant "I turned screenshots off" was a lie until the
+# next launch: the running pet kept using the values it had loaded.
+_config_stamp = None
+
+
+def _stamp():
+    try:
+        stat = os.stat(CONFIG_PATH)
+        return (stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        return None
+
+
+_config_stamp = _stamp()
+
+
+def reload_config_if_changed() -> bool:
+    """Re-read companion_config.json when it changed on disk.
+
+    Updates the existing CONFIG object in place, so every caller that holds a
+    reference (including a test patch) keeps its identity and starts seeing the
+    new values. Returns True when the config was actually reloaded.
+    """
+    global _config_stamp
+    stamp = _stamp()
+    if stamp is None or stamp == _config_stamp:
+        return False
+    fresh = _load_config()
+    with _lock:
+        CONFIG.clear()
+        CONFIG.update(fresh)
+        _config_stamp = stamp
+    return True
+
 
 # =====================================================================
 # Mutable state (all access under _lock)
@@ -190,10 +241,13 @@ _state = {
     "fatal_reason": "",        # e.g. "model_not_found"; cleared on config fix
     "token_budget": MIN_TOKEN_BUDGET,
 }
-_sent_log = {"idle": [], "screenshot": []}
+_sent_log = {"idle": [], "screenshot": [], "user": []}
 _daily = {"date": "", "count": 0}
 _last_capture = 0.0
 _warned = set()
+# What happened to recent capture attempts, newest last. Rule names and
+# reasons only -- never image content -- so this is safe to show in the menu.
+_capture_log = []
 
 
 def _warn_once(key, message):
@@ -222,9 +276,11 @@ def ai_configured() -> bool:
 
     Lets the UI distinguish "you never configured this" from "this is
     configured and failing", which is the difference between a hint and a
-    retry button.
+    retry button. Deliberately does not require MODEL to be set explicitly:
+    the module has a working default, and demanding an override made a pet
+    that talks fine report itself as unconfigured.
     """
-    return bool(_HAS_GROQ and _clients and os.environ.get("MODEL"))
+    return bool(_HAS_GROQ and _clients and MODEL)
 
 
 def reset_failures() -> None:
@@ -259,6 +315,89 @@ def screenshot_settings():
     return CONFIG.get("screenshots", {})
 
 
+def ocr_settings():
+    """The OCR content filter's config (see ocr_guard for the rule set)."""
+    cfg = CONFIG.get("screenshots", {}).get("ocr", {})
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def blocklist():
+    """The live screenshot blocklist. Always a list of strings."""
+    entries = CONFIG.get("screenshots", {}).get("blocklist", [])
+    if not isinstance(entries, list):
+        return []
+    return [str(e) for e in entries if str(e).strip()]
+
+
+def add_blocklist_entry(entry) -> bool:
+    """Add one entry to the screenshot blocklist and save. Returns True if it
+    was new. Used by the "Never Capture This App" menu action."""
+    entry = (entry or "").strip()
+    if not entry:
+        return False
+    with _lock:
+        entries = CONFIG.setdefault("screenshots", {}).setdefault("blocklist", [])
+        if not isinstance(entries, list):
+            entries = []
+            CONFIG["screenshots"]["blocklist"] = entries
+        if any(str(e).strip().lower() == entry.lower() for e in entries):
+            return False
+        entries.append(entry)
+    save_config()
+    return True
+
+
+def set_blocklist(entries) -> bool:
+    """Replace the whole blocklist (the Edit Blocklist dialog)."""
+    cleaned = [str(e).strip() for e in (entries or []) if str(e).strip()]
+    with _lock:
+        CONFIG.setdefault("screenshots", {})["blocklist"] = cleaned
+    return save_config()
+
+
+def note_capture_decision(action: str, reason: str = "") -> None:
+    """Record what happened to a capture attempt, for the menu.
+
+    `action` is a short label ("sent", "discarded", "blocked", "refused",
+    "off"); `reason` must never contain image content.
+    """
+    entry = {"at": time.time(), "action": str(action)[:24], "reason": str(reason)[:120]}
+    with _lock:
+        cap = int(CONFIG.get("screenshots", {}).get("capture_log_size", 20) or 20)
+        _capture_log.append(entry)
+        del _capture_log[:-max(1, cap)]
+
+
+def capture_decisions(limit: int = 5):
+    """The most recent capture decisions, newest first."""
+    with _lock:
+        return list(reversed(_capture_log[-max(1, limit):]))
+
+
+def last_capture_decision():
+    with _lock:
+        return _capture_log[-1] if _capture_log else None
+
+
+def screenshots_status_text() -> str:
+    """One line for the context menu: whether, and how, captures are gated."""
+    scfg = screenshot_settings()
+    if not scfg.get("enabled", False):
+        return "screenshots off"
+    bits = ["screenshots on, every %s min" % scfg.get("interval_minutes", 15)]
+    rules = len(blocklist())
+    if rules:
+        bits.append("%d blocklist rule%s" % (rules, "" if rules == 1 else "s"))
+    if ocr_settings().get("enabled", True):
+        bits.append("OCR filter")
+    last = last_capture_decision()
+    if last:
+        stamp = time.strftime("%H:%M", time.localtime(last["at"]))
+        bits.append("last %s %s%s" % (stamp, last["action"],
+                                      (" (%s)" % last["reason"]) if last["reason"] else ""))
+    return " - ".join(bits)
+
+
 def general_settings():
     """Config sections the pet itself reads (not the model's)."""
     return CONFIG
@@ -290,11 +429,13 @@ def get_system_prompt(skin):
 
 def save_config():
     """Write CONFIG back to companion_config.json, atomically."""
+    global _config_stamp
     tmp = CONFIG_PATH + ".tmp"
     try:
         with open(tmp, "w", encoding="utf-8") as handle:
             json.dump(CONFIG, handle, indent=2)
         os.replace(tmp, CONFIG_PATH)
+        _config_stamp = _stamp()
         return True
     except OSError as exc:
         _warn_once("config_write", "could not save companion_config.json: %r" % (exc,))
@@ -341,6 +482,10 @@ def _remember(fact):
         try:
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(mem, f, indent=2)
+            try:
+                os.chmod(tmp, 0o600)
+            except OSError:
+                pass
             os.replace(tmp, MEMORY_PATH)
         except Exception:
             try:
@@ -419,13 +564,17 @@ def _reserve(kind):
 
     Check and claim must be one critical section: doing them separately let
     two threads both pass the check and both send.
+
+    Pools are independent per kind. "user" is the one the Speak menu item and
+    petting use, so a canned-fallback budget cannot be eaten by the background
+    chatter pool -- which is what used to make Speak silently do nothing.
     """
     cfg = CONFIG.get("rate_limits", {})
     min_gap = cfg.get("min_seconds_between", {}).get(kind, 60)
     cap = cfg.get("max_per_hour", {}).get(kind, 6)
     now = time.time()
     with _lock:
-        log = _sent_log[kind]
+        log = _sent_log.setdefault(kind, [])
         log[:] = [t for t in log if now - t < 3600]
         if log and now - log[-1] < min_gap:
             return False
@@ -642,21 +791,32 @@ def _call(messages, max_tokens=MIN_TOKEN_BUDGET):
 # Public request API
 # =====================================================================
 
-def _run_worker(work):
+def _run_worker(work, on_crash=None):
+    """Run `work` on a daemon thread. `on_crash` gets called if it raises, so
+    a claimed rate-limit slot can be released instead of leaking."""
     def guarded():
         try:
             work()
         except Exception as exc:  # never let a worker die noisily
             _warn_once("worker", "background request crashed: %r" % (exc,))
+            if on_crash is not None:
+                try:
+                    on_crash()
+                except Exception:
+                    pass
     threading.Thread(target=guarded, daemon=True).start()
 
 
-def maybe_idle_line(skin, on_done):
-    """Ask for a spontaneous line. on_done(text, status)."""
+def maybe_idle_line(skin, on_done, kind="idle"):
+    """Ask for a spontaneous line. on_done(text, status).
+
+    `kind` selects the rate-limit pool: "idle" for background chatter, "user"
+    for a line the user explicitly asked for (the Speak menu item, petting).
+    """
     if not ai_enabled():
         on_done(None, STATUS_UNAVAILABLE)
         return
-    if not _reserve("idle"):
+    if not _reserve(kind):
         on_done(None, STATUS_SKIPPED)
         return
 
@@ -668,12 +828,45 @@ def maybe_idle_line(skin, on_done):
         ]
         raw = _call(messages, max_tokens=MIN_TOKEN_BUDGET)
         if not raw:
+            _release(kind)
+            on_done(None, STATUS_UNAVAILABLE)
+            return
+        on_done(_extract_memory(raw), STATUS_OK)
+
+    _run_worker(work, on_crash=lambda: _release(kind))
+
+
+def maybe_context_line(skin, context, on_done) -> bool:
+    """Ask for one line about the focused window. True if the request started.
+
+    Returns False (without calling `on_done`) when the idle pool is throttled
+    or the AI is off, so the caller can fall back to its canned line instead of
+    waiting for a reply that will never come.
+
+    Only ever receives a window title and process name -- never pixels. That
+    keeps it cheap, and keeps it outside the screenshot consent path.
+    """
+    if not ai_enabled():
+        return False
+    if not _reserve("idle"):
+        return False
+
+    def work():
+        messages = [
+            {"role": "system", "content": _system_prompt(skin)},
+            {"role": "user", "content":
+             "The user is looking at %s. Say one short in-character line about "
+             "it, without quoting the whole title." % (context or "their desktop")},
+        ]
+        raw = _call(messages, max_tokens=MIN_TOKEN_BUDGET)
+        if not raw:
             _release("idle")
             on_done(None, STATUS_UNAVAILABLE)
             return
         on_done(_extract_memory(raw), STATUS_OK)
 
-    _run_worker(work)
+    _run_worker(work, on_crash=lambda: _release("idle"))
+    return True
 
 
 def request_screenshot_comment(skin, image_b64, on_done, manual=False):
@@ -685,8 +878,8 @@ def request_screenshot_comment(skin, image_b64, on_done, manual=False):
 
     `manual` is a user-initiated capture from the menu: it works even when the
     automatic screenshot feature is switched off, because the user asked for it
-    directly. The privacy blocklist still applies -- that is enforced in
-    screen_capture before any pixels are read.
+    directly. The privacy blocklist and the OCR filter still apply -- those are
+    enforced in screen_capture before any pixels are sent.
     """
     scfg = CONFIG.get("screenshots", {})
     if not ai_enabled() or (not scfg.get("enabled", False) and not manual):
@@ -715,4 +908,4 @@ def request_screenshot_comment(skin, image_b64, on_done, manual=False):
             return
         on_done(_extract_memory(raw), STATUS_OK)
 
-    _run_worker(work)
+    _run_worker(work, on_crash=lambda: _release("screenshot"))

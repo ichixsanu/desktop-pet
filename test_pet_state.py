@@ -129,6 +129,124 @@ class TestPersistence(TempDirCase):
         store.save(force=True)  # must not raise
 
 
+class TestNewStateFields(TempDirCase):
+    """Fields the menu writes: they have to come back after a restart."""
+
+    def test_defaults(self):
+        store = pet_state.PetState(self.path)
+        data = store.load()
+        self.assertTrue(data["allow_jump"])
+        self.assertTrue(data["allow_chase"])
+        self.assertFalse(data["click_through"])
+        self.assertIsNone(data["display"])
+        self.assertEqual(data["treats_given"], 0)
+
+    def test_roundtrip(self):
+        store = pet_state.PetState(self.path, save_interval=0)
+        store.touch(allow_jump=False, allow_chase=False, click_through=True,
+                    display="DP-1", treats_given=4)
+        store.save(force=True)
+        data = pet_state.PetState(self.path).load()
+        self.assertFalse(data["allow_jump"])
+        self.assertFalse(data["allow_chase"])
+        self.assertTrue(data["click_through"])
+        self.assertEqual(data["display"], "DP-1")
+        self.assertEqual(data["treats_given"], 4)
+
+    def test_garbage_is_coerced(self):
+        with open(self.path, "w") as handle:
+            json.dump({"allow_jump": "yes please", "click_through": 0,
+                       "treats_given": -12, "display": {"not": "a string"},
+                       "allow_chase": "false"}, handle)
+        data = pet_state.PetState(self.path).load()
+        self.assertTrue(data["allow_jump"])
+        self.assertFalse(data["click_through"])
+        self.assertFalse(data["allow_chase"])
+        self.assertEqual(data["treats_given"], 0)
+        self.assertIsNone(data["display"])
+
+    def test_state_file_is_private(self):
+        # It records where someone sits on their desktop and when. 0664 was
+        # the old mode, which is world-readable.
+        store = pet_state.PetState(self.path, save_interval=0)
+        store.touch(x=5.0)
+        store.save(force=True)
+        mode = os.stat(self.path).st_mode & 0o777
+        self.assertEqual(mode, 0o600, "state file is not private: %o" % mode)
+
+
+class TestConfigurableDecay(TempDirCase):
+    def _aged_state(self, energy=100.0, hours=4.0):
+        store = pet_state.PetState(self.path, save_interval=0)
+        store.load()
+        store.touch(energy=energy)
+        store.save(force=True)
+        with open(self.path) as handle:
+            payload = json.load(handle)
+        payload["last_seen"] = time.time() - 3600 * hours
+        with open(self.path, "w") as handle:
+            json.dump(payload, handle)
+
+    def test_decay_rate_is_honoured(self):
+        # `state.energy_decay_per_hour` sat in the config doing nothing: the
+        # module constant was what actually ran.
+        self._aged_state()
+        default = pet_state.PetState(self.path)
+        default.load()
+        faster = pet_state.PetState(self.path, energy_decay_per_hour=50.0)
+        faster.load()
+        self.assertLess(faster.rested_energy(), default.rested_energy())
+
+    def test_zero_decay_keeps_the_pet_energetic(self):
+        self._aged_state()
+        store = pet_state.PetState(self.path, energy_decay_per_hour=0.0)
+        store.load()
+        self.assertEqual(store.rested_energy(), 100.0)
+
+    def test_nonsense_decay_rate_degrades(self):
+        store = pet_state.PetState(self.path, energy_decay_per_hour="lots")
+        self.assertGreater(store.energy_decay_per_hour, 0.0)
+        store = pet_state.PetState(self.path, energy_decay_per_hour=-3)
+        self.assertEqual(store.energy_decay_per_hour, 0.0)
+
+
+class TestLifetimeCounter(TempDirCase):
+    def test_seconds_alive_accumulate_across_sessions(self):
+        store = pet_state.PetState(self.path, save_interval=0)
+        store.load()
+        store.touch(seconds_alive=store.total_seconds_alive(120.0))
+        store.save(force=True)
+
+        store2 = pet_state.PetState(self.path, save_interval=0)
+        store2.load()
+        self.assertAlmostEqual(store2.lifetime_base, 120.0, delta=1.0)
+        # This session has been running 30s: the total is the saved lifetime
+        # plus *this* session, not plus everything ever stored.
+        self.assertAlmostEqual(store2.total_seconds_alive(30.0), 150.0, delta=1.0)
+
+    def test_repeated_saves_in_one_session_do_not_grow_the_total(self):
+        store = pet_state.PetState(self.path, save_interval=0)
+        store.load()
+        for uptime in (10.0, 60.0, 120.0):
+            store.touch(seconds_alive=store.total_seconds_alive(uptime))
+            store.save(force=True)
+        reloaded = pet_state.PetState(self.path, save_interval=0)
+        reloaded.load()
+        # The old code wrote the session uptime into the lifetime field, so
+        # each save added the whole session again.
+        self.assertAlmostEqual(reloaded.lifetime_base, 120.0, delta=1.0)
+        self.assertAlmostEqual(reloaded.total_seconds_alive(5.0), 125.0, delta=1.0)
+
+    def test_forget_resets_the_counter(self):
+        store = pet_state.PetState(self.path, save_interval=0)
+        store.touch(seconds_alive=5000.0)
+        store.save(force=True)
+        store.load()
+        store.forget()
+        self.assertEqual(store.lifetime_base, 0.0)
+        self.assertEqual(store.total_seconds_alive(10.0), 10.0)
+
+
 class TestFocusStateFile(TempDirCase):
     def test_reads_a_focus_file(self):
         path = os.path.join(self.tmp.name, "focus.json")

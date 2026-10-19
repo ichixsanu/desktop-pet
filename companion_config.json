@@ -19,18 +19,50 @@
     }
   },
   "rate_limits": {
-    "min_seconds_between": {"idle": 45, "screenshot": 900},
-    "max_per_hour": {"idle": 6, "screenshot": 4}
+    "min_seconds_between": {
+      "idle": 45,
+      "screenshot": 900,
+      "user": 5
+    },
+    "max_per_hour": {
+      "idle": 6,
+      "screenshot": 4,
+      "user": 60
+    }
   },
   "screenshots": {
     "enabled": false,
     "interval_minutes": 15,
     "max_per_day": 40,
     "require_recent_activity_minutes": 3,
-    "blocklist": ["keepass", "bitwarden", "1password", "signal", "private browsing", "incognito", "bank", "wallet"],
-    "jpeg_quality": 70
+    "blocklist": [
+      "keepass",
+      "bitwarden",
+      "1password",
+      "signal",
+      "private browsing",
+      "incognito",
+      "bank",
+      "wallet"
+    ],
+    "jpeg_quality": 70,
+    "capture_log_size": 20,
+    "ocr": {
+      "enabled": true,
+      "engine": "auto",
+      "fail_closed": true,
+      "max_width": 1600,
+      "timeout_seconds": 6,
+      "languages": "eng",
+      "psm": 3,
+      "extra_keywords": [],
+      "allowed_keywords": []
+    }
   },
-  "memory": {"enabled": true, "max_facts": 20},
+  "memory": {
+    "enabled": true,
+    "max_facts": 20
+  },
   "state": {
     "enabled": true,
     "file": "pet_state.json",
@@ -39,12 +71,23 @@
   },
   "focus": {
     "enabled": true,
-    "state_files": ["~/.focus.json", "~/.config/focus/state.json"],
+    "state_files": [
+      "~/.focus.json",
+      "~/.config/focus/state.json"
+    ],
     "poll_seconds": 5
   },
   "behaviour": {
     "ignore_windows": [],
     "allow_jump": true,
-    "allow_chase": true
+    "allow_chase": true,
+    "ai_context_lines": true,
+    "hide_on_fullscreen": false,
+    "sleep_when_idle_seconds": 300,
+    "quiet_hours": {
+      "enabled": false,
+      "start": "23:00",
+      "end": "07:00"
+    }
   }
 }
