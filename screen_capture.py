@@ -279,6 +279,51 @@ def scan_capture(image: QImage, ocr_config=None):
     return bool(verdict.ok), verdict.reason
 
 
+# ---- local-only Look At This --------------------------------------------
+
+# How "no model" Looks answer: the OCR text is sorted into one topic and the
+# reply is a canned line for it. The topics are category names -- text, code,
+# numbers, blank -- and never the OCR text itself.
+_TOPIC_RE = re.compile(r"\b\d[\d.,:/-]{2,}\b")
+_CODE_HINTS = (
+    "def ", "import ", "function ", "const ", "class ", "$ ", "git ",
+    "sudo ", "apt ", "npm ", "python ", "python3 ", "gcc", "make",
+    "traceback", "error:", "warning:", ">>>", "vim", "usage:",
+)
+
+
+def detect_topics(text: str) -> str:
+    """One topic name for a page of OCR text. Names only, never content."""
+    text = text or ""
+    if not text.strip():
+        return "blank"
+    lowered = text.lower()
+    if any(hint in lowered for hint in _CODE_HINTS):
+        return "code"
+    if len(_TOPIC_RE.findall(text)) >= 6:
+        return "numbers"
+    if len(text.split()) >= 40:
+        return "text"
+    return "blank"
+
+
+def capture_topics(image: QImage, ocr_config=None) -> str:
+    """What is on screen, as a single topic name.
+
+    Runs the OCR pass locally (nothing is sent, nothing is kept) and collapses
+    the text into a category the pet can comment on from a canned table. When
+    OCR is unavailable the answer is "blank", which is still better than
+    refusing: the pet saw *something*, it just does not know what.
+    """
+    if ocr_guard is None:
+        return "blank"
+    try:
+        text = ocr_guard.recognize(image, ocr_config)
+    except Exception:
+        return "blank"
+    return detect_topics((text or "")[:8000])
+
+
 def capture_with_redaction(app, blocklist, jpeg_quality=70, screen_rect=None,
                            ocr_config=None):
     """Synchronous capture, redacted, OCR-filtered and encoded. Blocks caller.

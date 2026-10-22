@@ -63,6 +63,13 @@
     "enabled": true,
     "max_facts": 20
   },
+  "audio": {
+    "enabled": true,
+    "volume": 0.3,
+    "voice": true,
+    "ambient": true,
+    "ambient_gap_seconds": 150
+  },
   "state": {
     "enabled": true,
     "file": "pet_state.json",

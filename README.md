@@ -12,6 +12,10 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
+or run `./install.sh`, which does the pip step, checks for `tesseract`, and
+installs a menu entry for the pet (`--autostart` also starts it at login;
+`--uninstall` removes the entries again).
+
 Optional but recommended: install `tesseract` with your system package manager
 (`apt install tesseract-ocr`, `pacman -S tesseract`, `brew install tesseract`).
 It powers the OCR content filter described under **Screenshots** below. Without
@@ -147,6 +151,61 @@ redacted — not recommended.
 Redaction rectangles are translated into the grabbed screen's coordinate space,
 so a second monitor does not shift them off target.
 
+### Wayland: Look At This through the portal
+
+Wayland sessions refuse out-of-process screen grabs by design, so the manual
+**Look At This** capture has a special path there: it asks the desktop portal
+(`org.freedesktop.portal.Screenshot`) to do the grabbing. The portal shows your
+compositor's own picker dialog, you choose the screen (or decline), and whatever
+comes back goes through the same OCR filter as every other capture. Because you
+sat in the picker dialog, *you* are the privacy gate — the blocklist cannot be
+honoured on Wayland, and nothing is pretended otherwise.
+
+- Off by default: set `"screenshots": { "wayland_portal": true }` in
+  `companion_config.json` to allow it.
+- Manual only. Automatic captures never take the portal path, and they never
+  try to grab on Wayland any other way.
+- The portal can only hand over a whole screen, so no redaction happens on that
+  path; the OCR filter still runs and can still discard the result.
+- Requires QtDBus (ships with PyQt5). If the portal service is not running or
+  the request times out (20s), the pet tells you and nothing was captured.
+
+### Sounds
+
+A tiny chiptune synth lives in `pet_sounds.py`: NES-style pulse waves, a
+stepped triangle and LFSR noise, with envelopes, pitch slides, arpeggios and
+vibrato. There are no audio files; every cue is a few lines of note data,
+rendered off the GUI thread and cached for the session. Audition them from a
+terminal:
+
+```
+python3 pet_sounds.py meow bark boo beep menace dance "say:hello there?"
+```
+
+Each companion has its own **call** (cat meow, shiba bark, ghost "boo", jarvis
+beeps, ultron rumble) and its own **talking voice**: when it speaks, the line
+is babbled as pitched syllable blips (Animal Crossing style) that rise on a
+question and jump on an exclamation.
+
+It is meant to be heard rarely:
+
+- Things *you* do always get an answer: a pat, a treat, a throw, a trick.
+- Things the pet does **on its own** (yawning, noticing the cursor, climbing,
+  dancing) share a single cooldown, at most one every `ambient_gap_seconds`
+  (150s by default).
+- It only talks out loud when answering you. A line it volunteers is voiced
+  about a third of the time at most, and only when the ambient cooldown allows.
+  Never during quiet hours, a snooze or a focus block.
+
+```json
+"audio": { "enabled": true, "volume": 0.3, "voice": true,
+           "ambient": true, "ambient_gap_seconds": 150 }
+```
+
+All of it is also in the right-click **Sound** menu. Playback goes through
+QSoundEffect, `pw-play`, `paplay`, `aplay`, `afplay` or `winsound`, whichever
+exists, and fails to silence, never to an error.
+
 **Never Capture This App** in the menu adds a `proc:` rule for whatever is
 focused right now (falling back to `title:` when the process name is not
 available), which is usually easier than typing it. **Edit Blocklist...** shows
@@ -210,6 +269,20 @@ reason, e.g. `sensitive text on screen (card number, password field)` or
 `focused window matches the blocklist`. The reasons name rules, never the text
 that matched.
 
+### Look At This with no model
+
+The manual look needs pixels to send while automatic captures need nothing to
+do when AI is off — those are different cases, and they are handled
+differently:
+
+- **Manual (Look At This)** with the model off still runs the whole capture
+  pipeline up to generation: policy gates, grab, local OCR. The reply is a
+  canned line keyed by what the screen holds (code, a wall of text, numbers,
+  or nothing). At no point in this flow is anything transmitted — this is the
+  "describe" version, not an "upload" with a canned ending.
+- **Automatic** captures simply do not happen when AI is off; there is no one
+  to comment to.
+
 ### Always on top
 
 The pet sets `WindowStaysOnTopHint` at startup, and re-applies its window flags
@@ -224,8 +297,13 @@ If `memory.enabled` is `true`, the model can end a reply with a line like
 stored in `companion_memory.json` (capped at `memory.max_facts`, oldest dropped
 first, duplicates ignored), and folded into future system prompts. The marker is
 stripped wherever it appears, including mid-sentence, so a chatty model can't
-make the pet say "memory:" out loud. Delete `companion_memory.json` any time to
-wipe it. This adds no extra API calls — it rides along in the normal reply.
+make the pet say "memory:" out loud. This adds no extra API calls — it rides
+along in the normal reply.
+
+**What Do You Remember?** in the menu shows everything currently kept, read
+only. The dialog's **Forget Everything** button (with a confirm step) is the
+only thing that erases the memory file — the other resets (*Forget Me*, state)
+deliberately leave it untouched.
 
 ## Coming back to the same pet
 
@@ -297,6 +375,47 @@ your timer stopped — the session is treated as over rather than ignored.
   up if you outrun it.
 - **Pounce / Jump** — real arcs under gravity, so a hop off a titlebar reads as
   a decision rather than a glitch. Both can be switched off in the menu.
+- **Throw** — drag fast and let go: the release velocity carries, the pet
+  travels through the air, lands (titled titlebar or floor, whichever is under
+  it) and complains about it. A slow release is still a placement, not a
+  throw. Cross-monitor drags re-seat the pet on the screen it was released on
+  before the arc decides where the floor is.
+
+## Reactions
+
+The pet reacts to things with its body as well as its mouth. Every companion
+has frames for all of these:
+
+- **Pat it** (click): it leans into your hand, with hearts. Pat it a few times
+  in a row and it hops for joy. Poke it while it is deep asleep and it sulks.
+- **Double-click**: a trick. It hops, turns around mid-air and sparkles.
+- **Give a Treat**: it eats (a bowl for the cat and shiba, a cookie for the
+  ghost, a battery filling up on the robots' screens), then celebrates.
+- **Shake it** while dragging (wiggle left and right): it lands dizzy, with
+  stars circling its head. A very hard throw can do the same.
+- **Flick the cursor** past it: ears up, a "!" over its head. It does not
+  fall for this every time.
+- **Play > Laser Pointer**: for 30 seconds it sprints after your cursor and
+  pounces on it.
+- **Play > Dance!**: a short dance with music notes. A happy, rested pet
+  sometimes dances on its own.
+- **Yawns** as it nods off and as it wakes up, **Zzz** while asleep, dust when
+  it lands or runs, sweat drops when it is running on empty.
+
+Particles are drawn on the same pixel grid as the sprite, in a separate
+click-through overlay window, so a heart at 4x is made of the same 4px blocks
+as the cat. Speech types itself into a pixel-art bubble.
+
+## Daily life
+
+- **Anniversaries** — once per completed day of total lifetime, the pet marks
+  it with one line. The counter is the accumulated lifetime across sessions,
+  and the milestone is saved the moment it triggers so a restart can't repeat
+  it.
+- **Wake-ups** — wake a napping pet and it sometimes has a word to say about
+  being interrupted.
+- Energy drains with activity and recovers while resting, and `state.energy_decay_per_hour`
+  applies while the app is closed.
 
 ## Windows the pet should ignore
 
@@ -311,10 +430,14 @@ Three `behaviour` settings decide when the pet stays quiet, all optional:
 
 - `hide_on_fullscreen` (default `true`) — hides while a fullscreen window is
   focused (a film, a game, a slideshow) and comes back when it isn't. It still
-  checks once a second, so it is off your screen but not asleep.
+  checks once a second, so it is off your screen but not asleep. Detection is
+  geometric on every platform (window rect vs screen), with an X11 hint where
+  the window manager can answer directly.
 - `sleep_when_idle_seconds` (default `300`) — after this long with no keyboard
   or mouse input, the pet naps and stops wandering an empty screen. It wakes on
-  your next input. `0` disables it.
+  your next input. `0` disables it. Idle time comes from the OS where possible:
+  XScreenSaver on Linux, `GetLastInputInfo` on Windows, `CGEventSource` on
+  macOS; without one the pet falls back to its own cursor-activity signal.
 - `quiet_hours` — `{"enabled": true, "start": "23:00", "end": "07:00"}`
   (windows that cross midnight work) suppresses idle chatter and window
   comments. Lines you asked for still happen: quiet hours mean "don't
@@ -343,7 +466,9 @@ boundary.
 ## Right-click menu
 
 - **Switch Companion** — cat, shiba, ghost, jarvis, ultron.
-- **Scale** — 1x to 4x.
+- **Scale** — 1x to 8x, always a whole multiple of the 16x16 art, so every
+  art pixel is an identical square (on a HiDPI screen the sprites are built
+  at the physical resolution, not upscaled twice).
 - **Climb Windows**, **Allow Jumping**, **Allow Chasing**, **Click Through** —
   behaviour toggles. Click-through makes the pet ignore the mouse entirely
   (handy on a busy screen); the tray icon still offers the full menu, which is
@@ -351,6 +476,13 @@ boundary.
 - **Focus Timer** — enable/disable reading the focus file without editing JSON.
 - **Speak** — ask for a line now.
 - **Give a Treat** — a small energy top-up, on a cooldown.
+- **Play** — **Dance!**, **Do a Trick**, **Laser Pointer**.
+- **Sound** — sounds on/off, the talking voice, rare sounds on its own, and
+  Quiet / Normal / Loud.
+- **Shush...** — 15 minutes / 1 hour / 2 hours of silence for films and calls
+  (session-only: quiet hours are the permanent version). Unshush any time, or
+  just pet the pet — being touched ends the snooze early. Requested lines
+  (Speak, petting, Look At This) are never muted by a snooze.
 - **Screenshots && Privacy** — the whole capture policy in one submenu:
   - **Look At My Screen** — turn automatic captures on/off.
   - **Look At This** — capture the screen once and comment on it. Works even
@@ -365,6 +497,8 @@ boundary.
 - **Ignore Windows...** — windows the pet must not stand on.
 - **Reset Position** — back to the middle of the floor.
 - **Forget Me** — delete the saved session.
+- **What Do You Remember?** — read back the pet's long-term memory (see
+  **Memory**), with an explicit erase behind a confirm dialog.
 - A status line showing whether AI is on, and **Retry AI** if it is configured
   but failing. Below it, a small stats line (time alive, sessions, pets,
   treats).
@@ -381,19 +515,26 @@ because a request is in flight.
 ## Tests
 
 ```
-python3 -m unittest discover -p 'test_*.py'
+python3 -m unittest discover tests
 ```
 
-372 tests, no third-party test runner needed. They cover the window-tracker's
-geometry, caching, HiDPI conversion, Wayland trust rules and ignore list; the
-model's result contract, rate limiting, key rotation, `MEMORY:` parsing and
-config hot-reload; redaction, the blocklist prefixes and the refusal rules; the
-OCR filter including its own false-positive rules and its fail-closed
-behaviour; persistence, the focus file and the lifetime counter; and the pet's
-FSM invariants — never `PERCH` without a ledge, never walk off a titlebar, never
-stand on a window that closed, climbs finish, drag clamping, bubble layout,
-mood and energy behaviour, quiet hours, the idle nap, fullscreen hiding, and a
-6000-tick randomised run that asserts every invariant on every single tick.
+Run it from the repository root. About 480 tests, no third-party test runner
+needed. They cover the window-tracker's
+geometry, caching, HiDPI conversion, Wayland trust rules and ignore list, and
+the macOS CoreGraphics backends; the model's result contract, rate limiting,
+key rotation, `MEMORY:` parsing and config hot-reload; redaction, the blocklist
+prefixes and the refusal rules; the OCR filter including its own
+false-positive rules and its fail-closed behaviour; the Wayland portal flow
+against a faked D-Bus (interactive flag, single-answer latch, timeout, URI
+cleanup); the synthesizer (valid WAVs, normalised levels, no DC offset or clicks), the
+babble voices and the ambient-sound cooldown; the sprite pipeline (every skin
+validates and the PNGs on disk match the generator); persistence, the
+focus file and the lifetime counter; and the pet's FSM invariants — never
+`PERCH` without a ledge, never walk off a titlebar, never stand on a window
+that closed, climbs finish, drag clamping, bubble layout, mood and energy
+behaviour, quiet hours, the idle nap, fullscreen hiding, the memory-recall
+menu, and a 6000-tick randomised run that asserts every invariant on every
+single tick.
 
 ## Troubleshooting
 
@@ -403,6 +544,10 @@ guarded; this file is where a guarded failure would show up. Set `PET_DEBUG=1`
 to also print those tracebacks to stderr.
 
 ## Running it in the background
+
+`./install.sh --autostart` writes a desktop entry into your autostart folder
+(Linux/BSD; the plain `./install.sh` run only installs the menu entry and
+dependencies). Otherwise:
 
 **pm2** (any OS with Node/pm2 installed):
 
@@ -432,13 +577,17 @@ then `systemctl --user enable --now desktop-pet`.
 
 ## Notes
 
-- Sprites are plain PNGs under `skins/<name>/`; drop a new skin in as
-  `skins/<name>/` with any subset of `sit_0.png`, `walk_0.png`, `sleep_0.png`
-  and it appears in the menu on next launch; missing states fall back
-  gracefully. `generate_sprites.py` regenerates them from the sprite modules
-  (`sprites_cat.py`, ...). Those modules are a work in progress: `--check`
-  validates what exists and tells you which module is still missing its
-  `frames()` instead of crashing, and it writes nothing until a module passes.
+- Sprites are 16×16 pixel art. The source of truth is the code in `art/`:
+  `sprites_quad.py` is a four-legged rig shared by the cat and the shiba
+  (species differ in head, ears, tail and markings), `sprites_ghost.py` and
+  `sprites_bots.py` draw the rest, on top of the tiny engine in `pixelart.py`.
+  `python3 art/generate_sprites.py` rebuilds `skins/<name>/*.png`
+  (`--check` validates only, `--sheet` writes a contact sheet to look at).
+  The PNGs are committed so the pet runs without a build step, and a test
+  fails if they drift from the generator.
+- A hand-made skin still works: drop PNGs into `skins/<name>/` named
+  `<animation>_<n>.png` (any subset of `sit`, `walk`, `run`, `sleep`, `happy`,
+  ...) and it appears in the menu; missing animations fall back gracefully.
 - State that is private stays private: `pet_state.json`,
   `companion_memory.json` and the capture log are written with `0600`
   permissions, and `.env` should be too (`chmod 600 .env`).

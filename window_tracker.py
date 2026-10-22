@@ -15,6 +15,9 @@ Platform notes:
 - Wayland: cannot be enumerated by design. `detection_is_complete()` returns
   False for any Wayland session so privacy-sensitive callers can fail
   closed instead of believing they filtered something they never saw.
+- macOS: CoreGraphics via ctypes. The on-screen window list (layer 0,
+  front-to-back) supplies the active window for dialogue and for the
+  geometric fullscreen check; idle time comes from CGEventSource.
 
 Coordinate space: OS window APIs report native pixels, Qt reports logical
 pixels. On a HiDPI display those differ by `devicePixelRatio`, so the pet
@@ -33,6 +36,7 @@ from typing import Any, List, NamedTuple, Optional, Sequence, Tuple, Union
 
 IS_WIN = sys.platform.startswith("win")
 IS_LINUX = sys.platform.startswith("linux")
+IS_MAC = sys.platform == "darwin"
 
 try:
     import psutil
@@ -386,6 +390,150 @@ def wayland_session() -> bool:
     return bool(os.environ.get("WAYLAND_DISPLAY"))
 
 
+# ---- macOS: CoreGraphics via ctypes -------------------------------------
+
+_macos_handles = None
+
+
+def _macos_core_foundation():
+    """(CoreGraphics, CoreFoundation) CDLL handles, loaded once."""
+    global _macos_handles
+    if _macos_handles is not None:
+        return _macos_handles
+    try:
+        import ctypes
+
+        cg = ctypes.CDLL("/System/Library/Frameworks/"
+                         "CoreGraphics.framework/CoreGraphics")
+        cf = ctypes.CDLL("/System/Library/Frameworks/"
+                         "CoreFoundation.framework/CoreFoundation")
+        _macos_handles = (cg, cf)
+    except Exception:
+        _macos_handles = (None, None)
+    return _macos_handles
+
+
+def _macos_active_window() -> Optional[WindowInfo]:
+    """The frontmost normal-layer window, via CGWindowListCopyWindowInfo.
+
+    macOS has no public focused-window API that is both cheap and complete;
+    the on-screen window list ordered front-to-back, filtered to layer 0
+    (ordinary app windows), starts with the focused app's main window. That
+    is close enough for dialogue context and for the geometric fullscreen
+    check, and every failure path returns None rather than guessing.
+    """
+    if not IS_MAC:
+        return None
+    core, cf = _macos_core_foundation()
+    if not core or not cf:
+        return None
+    try:
+        import ctypes
+
+        # kCGWindowListOptionOnScreenOnly(1) | kCGWindowListExcludeDesktopElements(16)
+        core.CGWindowListCopyWindowInfo.restype = ctypes.c_void_p
+        core.CGWindowListCopyWindowInfo.argtypes = [ctypes.c_uint32,
+                                                    ctypes.c_uint32]
+        array = core.CGWindowListCopyWindowInfo(1 | 16, 0)
+        if not array:
+            return None
+
+        cf.CFArrayGetCount.restype = ctypes.c_long
+        cf.CFArrayGetCount.argtypes = [ctypes.c_void_p]
+        cf.CFArrayGetValueAtIndex.restype = ctypes.c_void_p
+        cf.CFArrayGetValueAtIndex.argtypes = [ctypes.c_void_p, ctypes.c_long]
+        cf.CFDictionaryGetValue.restype = ctypes.c_void_p
+        cf.CFDictionaryGetValue.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        cf.CFStringCreateWithCString.restype = ctypes.c_void_p
+        cf.CFStringCreateWithCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p,
+                                                 ctypes.c_uint32]
+        cf.CFNumberGetValue.restype = ctypes.c_bool
+        cf.CFNumberGetValue.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                        ctypes.c_void_p]
+        cf.CFStringGetCString.restype = ctypes.c_bool
+        cf.CFStringGetCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p,
+                                          ctypes.c_long, ctypes.c_uint32]
+        utf8 = 0x08000100          # kCFStringEncodingUTF8
+
+        def key(name):
+            return cf.CFStringCreateWithCString(None, name.encode(), utf8)
+
+        def number(dict_ref, cf_key, kind):
+            raw = cf.CFDictionaryGetValue(dict_ref, cf_key)
+            if not raw:
+                return None
+            box = (ctypes.c_double if kind == "f" else ctypes.c_int32)()
+            code = 6 if kind == "f" else 3   # kCFNumberFloat64/SInt32
+            if not cf.CFNumberGetValue(raw, code, ctypes.byref(box)):
+                return None
+            return box.value
+
+        def text(dict_ref, cf_key):
+            raw = cf.CFDictionaryGetValue(dict_ref, cf_key)
+            if not raw:
+                return ""
+            buf = ctypes.create_string_buffer(256)
+            if not cf.CFStringGetCString(raw, buf, 256, utf8):
+                return ""
+            return buf.value.decode("utf-8", "replace")
+
+        k_layer = key("kCGWindowLayer")
+        k_bounds = key("kCGWindowBounds")
+        k_pid = key("kCGWindowOwnerPID")
+        k_name = key("kCGWindowName")
+        k_owner = key("kCGWindowOwnerName")
+        k_x, k_y = key("X"), key("Y")
+        k_w, k_h = key("Width"), key("Height")
+
+        count = cf.CFArrayGetCount(array)
+        for index in range(min(count, 40)):
+            item = cf.CFArrayGetValueAtIndex(array, index)
+            if not item:
+                continue
+            if number(item, k_layer, "i") != 0:
+                continue                     # menus, dock, overlays: skip
+            bounds = cf.CFDictionaryGetValue(item, k_bounds)
+            if not bounds:
+                continue
+            left = number(bounds, k_x, "f")
+            top = number(bounds, k_y, "f")
+            width = number(bounds, k_w, "f")
+            height = number(bounds, k_h, "f")
+            if None in (left, top, width, height):
+                continue
+            if width < 60 or height < 40:
+                continue                     # tooltips and splash screens
+            pid = number(item, k_pid, "i")
+            title = text(item, k_name) or text(item, k_owner)
+            rect = (int(left), int(top), int(left + width), int(top + height))
+            return WindowInfo(id=pid or 0, title=title, rect=rect,
+                              process="", pid=pid or None)
+    except Exception:
+        return None
+    return None
+
+
+def _macos_idle_seconds() -> Optional[float]:
+    """Seconds since the last user input, from the combined session state."""
+    core, _ = _macos_core_foundation()
+    if not core:
+        return None
+    try:
+        import ctypes
+
+        fn = core.CGEventSourceSecondsSinceLastEventType
+        fn.restype = ctypes.c_double
+        fn.argtypes = [ctypes.c_int32, ctypes.c_uint64]
+        # kCGEventSourceStateCombinedSessionState (-1) and kCGAnyInputEventType (~0)
+        seconds = fn(ctypes.c_int32(-1), ctypes.c_uint64(2 ** 64 - 1))
+        value = float(seconds)
+        if value < 0:
+            return None
+        return value
+    except Exception:
+        return None
+
+
 def _detection_is_complete() -> bool:
     """Whether we can see *every* window on the desktop.
 
@@ -397,6 +545,8 @@ def _detection_is_complete() -> bool:
     """
     if IS_WIN:
         return True
+    if IS_MAC:
+        return True              # Aqua reports the whole desktop
     if wayland_session():
         return False
     if IS_LINUX:
@@ -406,6 +556,8 @@ def _detection_is_complete() -> bool:
 def window_detection_available() -> bool:
     """Whether any OS window query works (subset of the desktop is fine)."""
     if IS_WIN:
+        return True
+    if IS_MAC:
         return True
     if IS_LINUX:
         return _get_xlib() is not None
@@ -1030,7 +1182,8 @@ class WindowTracker:
             raw_windows, taskbar = self._query_os_windows()
             try:
                 active = _win32_active_window() if IS_WIN else (
-                    _linux_active_window() if IS_LINUX else None)
+                    _linux_active_window() if IS_LINUX else (
+                        _macos_active_window() if IS_MAC else None))
             except Exception:
                 active = None
             try:
@@ -1426,8 +1579,9 @@ def idle_seconds() -> Optional[float]:
     """Seconds since the last user input, when the platform can tell us.
 
     X11: the XScreenSaver extension, which is what xprintidle uses. Windows:
-    GetLastInputInfo. Returns None when there is no answer, and the pet falls
-    back to its own cursor-activity signal.
+    GetLastInputInfo. macOS: CGEventSourceSecondsSinceLastEventType over the
+    combined session state. Returns None when there is no answer, and the pet
+    falls back to its own cursor-activity signal.
     """
     if IS_WIN:
         try:
@@ -1444,6 +1598,8 @@ def idle_seconds() -> Optional[float]:
             return max(0.0, millis / 1000.0)
         except Exception:
             return None
+    if IS_MAC:
+        return _macos_idle_seconds()
     if IS_LINUX:
         try:
             from Xlib.ext import screensaver

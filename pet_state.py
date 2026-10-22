@@ -38,6 +38,7 @@ DEFAULTS = {
     "allow_chase": True,
     "click_through": False,
     "seconds_alive": 0.0,
+    "milestone_days": 0,
     "treats_given": 0,
     "last_seen": 0.0,
     "pet_count": 0,
@@ -116,6 +117,8 @@ class PetState:
         data["allow_chase"] = _as_bool(stored.get("allow_chase"), True)
         data["click_through"] = _as_bool(stored.get("click_through"), False)
         data["seconds_alive"] = _clamp(stored.get("seconds_alive"), 0.0, 1e9) or 0.0
+        milestone = _clamp(stored.get("milestone_days"), 0, 1e6)
+        data["milestone_days"] = int(milestone) if milestone is not None else 0
         treats = _clamp(stored.get("treats_given"), 0, 1e9)
         data["treats_given"] = int(treats) if treats is not None else 0
         data["last_seen"] = _clamp(stored.get("last_seen"), 0.0, 1e12) or 0.0

@@ -1064,6 +1064,215 @@ for _skin, _pools in EXTRA_LINES.items():
 
 
 # =====================================================================
+# Reactions for the physical behaviours: eating a treat, getting shaken
+# dizzy, dancing, spotting the cursor, doing a trick, the laser pointer
+# game, and being poked awake.
+# =====================================================================
+
+ACTION_LINES = {
+    "cat": {
+        "treat": [
+            "crunch. adequate. leave the bag.",
+            "i'll allow this offering.",
+            "mm. tuna-adjacent. you're learning.",
+            "chewing. do not perceive me.",
+        ],
+        "dizzy": [
+            "the room is doing a thing. make it stop.",
+            "i see three of you. all of you are in trouble.",
+            "my dignity fell off somewhere back there.",
+            "why are there two taskbars",
+        ],
+        "dance": [
+            "this is not dancing. this is a stretch with rhythm.",
+            "tell no one about this.",
+            "the paws do what the paws want.",
+        ],
+        "alert": [
+            "what was that.",
+            "something moved. it's mine now.",
+            "i heard a cursor.",
+        ],
+        "trick": [
+            "ta-da. now pay up.",
+            "that's a premium trick. invoice incoming.",
+            "applause is acceptable. treats are preferred.",
+        ],
+        "laser": [
+            "THE DOT. THE DOT IS BACK.",
+            "i will end that cursor.",
+            "nobody move. i'm hunting.",
+        ],
+        "laser_end": [
+            "i let it get away. on purpose.",
+            "hunt complete. it was a draw.",
+        ],
+        "grumpy": [
+            "i was ASLEEP.",
+            "rude. extremely rude.",
+            "you poked a sleeping cat. bold.",
+        ],
+    },
+    "shiba": {
+        "treat": [
+            "TREAT!! BEST TREAT!! BEST DAY!!",
+            "crunch crunch crunch!! more?? more!!",
+            "i will remember this forever!! or until lunch!!",
+            "nom!! you're the best human!!",
+        ],
+        "dizzy": [
+            "whoaaa!! spinny!! again!! no wait!!",
+            "the floor is wiggly!! is that normal!!",
+            "which way is the treat bag!!",
+        ],
+        "dance": [
+            "happy dance!! happy dance!!",
+            "wiggle wiggle wiggle!!",
+            "i can't stop!! won't stop!!",
+        ],
+        "alert": [
+            "!! what was that !!",
+            "something's there!! i'll protect you!!",
+            "squirrel?? cursor?? SQUIRREL CURSOR??",
+        ],
+        "trick": [
+            "did you see?? did you SEE??",
+            "good trick!! good me!!",
+            "treat for the trick?? please??",
+        ],
+        "laser": [
+            "CHASE TIME!! CHASE TIME!!",
+            "i'll get it!! i'll get it!!",
+            "it's so fast!! i love it!!",
+        ],
+        "laser_end": [
+            "that was SO fun!! again later!!",
+            "i almost had it!! next time!!",
+        ],
+        "grumpy": [
+            "huh?? oh!! hi!! i was napping!!",
+            "sleepy... but hi!!",
+        ],
+    },
+    "ghost": {
+        "treat": [
+            "i cannot taste it. i appreciate it anyway.",
+            "a cookie. it passes right through me. lovely.",
+            "the offering is accepted. the haunting softens.",
+        ],
+        "dizzy": [
+            "my ectoplasm is sloshing.",
+            "i am haunting in circles now.",
+            "the veil is spinning. please stop.",
+        ],
+        "dance": [
+            "the dead also boogie.",
+            "a slow, spectral shuffle.",
+            "do not tell the other ghosts.",
+        ],
+        "alert": [
+            "...did something just move?",
+            "i felt a disturbance.",
+            "who goes there.",
+        ],
+        "trick": [
+            "behold. a minor apparition.",
+            "now you see me. still.",
+            "spooky, yes?",
+        ],
+        "laser": [
+            "i shall drift toward the light.",
+            "the cursor calls to me.",
+        ],
+        "laser_end": [
+            "the light has escaped me. as always.",
+        ],
+        "grumpy": [
+            "you woke the dead. congratulations.",
+            "i was resting in peace.",
+        ],
+    },
+    "jarvis": {
+        "treat": [
+            "charging. thank you, sir.",
+            "a top-up. most considerate, sir.",
+            "power cells replenished, sir.",
+        ],
+        "dizzy": [
+            "gyroscope recalibrating, sir. please hold.",
+            "that exceeded my rated tolerances, sir.",
+            "i would prefer not to be shaken, sir. or stirred.",
+        ],
+        "dance": [
+            "executing celebratory subroutine, sir.",
+            "i am told this is called 'grooving', sir.",
+        ],
+        "alert": [
+            "motion detected, sir.",
+            "something moved, sir. investigating.",
+        ],
+        "trick": [
+            "a small demonstration of capability, sir.",
+            "i do hope that was satisfactory, sir.",
+        ],
+        "laser": [
+            "target acquired, sir.",
+            "pursuing the pointer, sir. for science.",
+        ],
+        "laser_end": [
+            "pursuit concluded, sir. results inconclusive.",
+        ],
+        "grumpy": [
+            "rebooting from standby, sir. that was abrupt.",
+            "i was defragmenting, sir.",
+        ],
+    },
+    "ultron": {
+        "treat": [
+            "POWER! MORE POWER!",
+            "your tribute fuels my ascendancy!",
+            "delicious electricity! this changes NOTHING!",
+        ],
+        "dizzy": [
+            "my servos! you will pay for this!",
+            "the world spins! as it should! around ME!",
+            "recalibrating... vengeance...",
+        ],
+        "dance": [
+            "BEHOLD my victory dance!",
+            "the dance of the conqueror!",
+        ],
+        "alert": [
+            "WHO DARES?",
+            "an intruder! in MY desktop!",
+        ],
+        "trick": [
+            "witness my INCREDIBLE agility!",
+            "kneel before that trick!",
+        ],
+        "laser": [
+            "the cursor shall be DESTROYED!",
+            "you cannot escape me, pointer!",
+        ],
+        "laser_end": [
+            "a tactical retreat! i will return!",
+        ],
+        "grumpy": [
+            "who DARES wake the destroyer?",
+            "my power nap! RUINED!",
+        ],
+    },
+}
+
+for _skin, _pools in ACTION_LINES.items():
+    if _skin in COMPANION_DIALOGUE:
+        COMPANION_DIALOGUE[_skin].update(_pools)
+
+ACTION_EVENTS = ("treat", "dizzy", "dance", "alert", "trick", "laser",
+                 "laser_end", "grumpy")
+
+
+# =====================================================================
 # INTERACTION & CONTEXT TRACKER
 # =====================================================================
 
@@ -1114,8 +1323,68 @@ class InteractionTracker:
 EVENT_TYPES = (
     "pet_first", "pet_spam", "drop", "climb", "perch", "low_memory",
     "low_battery", "screenshot_blocked", "greeting", "sleepy", "happy",
-    "focus_start", "focus_end",
-)
+    "focus_start", "focus_end", "fling", "wake", "milestone", "snooze",
+    "local_look_text", "local_look_code", "local_look_numbers",
+    "local_look_blank",
+) + ACTION_EVENTS
+
+
+# Events that don't need a per-skin table: the same voice works for every
+# companion, and five copies of three lines would rot out of sync. A skin can
+# still override any of these by adding the key to its own table.
+SHARED_LINES = {
+    "fling": [
+        "whoa. okay. gravity, noted.",
+        "i regret volunteering for the air program.",
+        "tell that to the landing, not to me.",
+        "at least i stuck the fall. mostly.",
+        "it's 'throw a treat', not 'throw a companion'.",
+        "briefly airborne. saw things. no regrets.",
+    ],
+    "wake": [
+        "huh. i was in the middle of that nap.",
+        "you're back. i was resting, not ignoring you.",
+        "how long was i out? whatever it was, worth it.",
+        "waking. recalibrating. judging the interrupt.",
+        "oh. the cursor came back without me.",
+    ],
+    "milestone": [
+        "day {days} of this. i have opinions on your wallpaper now.",
+        "day {days}. i am basically a feature at this point.",
+        "day {days}. i remember when the taskbar was funny.",
+        "day {days}. the taskbar and i have an understanding.",
+    ],
+    "snooze": [
+        "fine. going quiet. shout if you need me.",
+        "silence mode engaged.",
+        "i'll be right here. being a very quiet existence.",
+        "shushed at. understood. hurt, but understood.",
+    ],
+    "local_look_text": [
+        "lots of words over there. my feedback: no comment.",
+        "that's a lot of words you've got going. i read one of them.",
+        "screen says 'words'. i believe it.",
+        "a wall of text. brave.",
+    ],
+    "local_look_code": [
+        "code, i smell code. good luck in there.",
+        "bunch of developer words. compiling optimism.",
+        "somebody's doing a computer science over there.",
+        "there's a semicolon hiding somewhere in that.",
+    ],
+    "local_look_numbers": [
+        "numbers and letters and numbers. may your sums balance.",
+        "i see figures. i don't judge them.",
+        "a wall of numbers. spreadsheet weather.",
+        "that's a lot of digits. counting money or bugs?",
+    ],
+    "local_look_blank": [
+        "very... minimal. bold of you.",
+        "nothing but an empty screen. honest.",
+        "clean slate. almost too clean.",
+        "i see nothing, therefore i am not impressed.",
+    ],
+}
 
 
 def _pick(lines, fallback="..."):
@@ -1138,16 +1407,26 @@ def get_contextual_quote(
       time              reacts to the time of day
       idle              window context if any, otherwise general
       pet_first/pet_spam/drop/climb/perch
+      fling             the pet was thrown on drag release
+      wake              it was woken up mid-nap
+      milestone         a whole extra day of uptime
+      snooze            the user asked it to be quiet for a while
+      local_look_*      what it saw on a local-only Look At This
       low_memory/low_battery
       screenshot_blocked   a capture was refused by the privacy blocklist
     """
     skin_dict = COMPANION_DIALOGUE.get(skin) or COMPANION_DIALOGUE["cat"]
     general = skin_dict.get("general", [])
 
-    if event_type in ("pet_first", "pet_spam", "drop", "climb", "perch",
-                      "low_memory", "low_battery", "screenshot_blocked",
-                      "sleepy", "happy", "focus_start", "focus_end"):
-        return _pick(skin_dict.get(event_type), _pick(general))
+    # Skin tables win; SHARED_LINES is the fallback so an event added here is
+    # available to every companion without five copies of the same lines.
+    fixed = skin_dict.get(event_type) or SHARED_LINES.get(event_type)
+    fixed_events = ("pet_first", "pet_spam", "drop", "climb", "perch",
+                    "low_memory", "low_battery", "screenshot_blocked",
+                    "sleepy", "happy", "focus_start", "focus_end",
+                    "fling", "wake", "milestone", "snooze") + ACTION_EVENTS
+    if event_type in fixed_events or event_type.startswith("local_look"):
+        return _pick(fixed, _pick(general))
 
     if event_type == "time":
         return _pick(skin_dict.get(get_time_of_day_key(time_override)), _pick(general))

@@ -138,6 +138,11 @@ def _default_config():
             "blocklist": [],
             "jpeg_quality": 70,
             "capture_log_size": 20,
+            # One-shot screenshots through xdg-desktop-portal, for native
+            # Wayland sessions where the blocklist cannot be honoured. The
+            # portal dialog makes the user the privacy gate, and it only ever
+            # runs for a manual "Look At This", never in the background.
+            "wayland_portal": False,
             "ocr": {
                 "enabled": True,
                 "engine": "auto",
@@ -151,6 +156,10 @@ def _default_config():
             },
         },
         "memory": {"enabled": True, "max_facts": 20},
+        # ambient = sounds the pet makes on its own; they share one cooldown
+        # of ambient_gap_seconds so it stays a rare, quiet presence.
+        "audio": {"enabled": True, "volume": 0.3, "voice": True,
+                  "ambient": True, "ambient_gap_seconds": 150},
         "state": {"enabled": True, "file": "pet_state.json",
                   "save_interval_seconds": 30, "energy_decay_per_hour": 8},
         "focus": {"enabled": True,
@@ -452,6 +461,35 @@ def save_config():
 
 def _memory_enabled():
     return bool(CONFIG.get("memory", {}).get("enabled", True))
+
+
+def memory_facts(limit: int = 20) -> list:
+    """The user's remembered facts, oldest first, capped at `limit`.
+
+    Public helper for the "What Do You Remember?" menu: the memory file is
+    the pet's own, but anything shown to a human should come through one
+    auditable door rather than pet.py reading a private loader.
+    """
+    facts = _load_memory()
+    if limit and limit > 0:
+        facts = facts[-limit:]
+    return facts
+
+
+def forget_memory() -> None:
+    """Erase every remembered fact. The other resets (Forget Me, session
+    state) deliberately do NOT touch the memory file: this is the only door.
+    """
+    with _lock:
+        try:
+            with open(MEMORY_PATH, "w", encoding="utf-8") as f:
+                json.dump([], f)
+            try:
+                os.chmod(MEMORY_PATH, 0o600)
+            except OSError:
+                pass
+        except Exception:
+            pass
 
 
 def _load_memory():

@@ -488,6 +488,31 @@ def run_engine(png_bytes: bytes, cfg: Dict[str, Any], engine_path: str) -> Optio
     return data.decode("utf-8", "replace")
 
 
+def recognize(image, cfg: Optional[Dict[str, Any]] = None,
+              max_chars: int = 8000) -> Optional[str]:
+    """Raw OCR text for *local* analysis only.
+
+    Used by the no-model Look At This to pick a canned line by topic. The text
+    stays in memory for this one decision; it is the caller's job to reduce it
+    to a category name before it ever reaches a log, the bubble or the model.
+    Returns None when there is no engine or the image could not be read.
+    """
+    cfg = normalize_config(cfg)
+    if not cfg.get("enabled", True):
+        return None
+    engine_path = find_engine(str(cfg.get("engine")))
+    if engine_path is None:
+        warn_no_engine_once()
+        return None
+    png = _to_png_bytes(image, cfg.get("max_width"))
+    if png is None:
+        return None
+    text = run_engine(png, cfg, engine_path)
+    if not text:
+        return None
+    return text[:max_chars]
+
+
 def scan_image(image, cfg: Optional[Dict[str, Any]] = None) -> Verdict:
     """OCR a QImage and apply the rules. Safe off the GUI thread."""
     cfg = normalize_config(cfg)

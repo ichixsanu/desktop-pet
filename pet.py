@@ -35,13 +35,16 @@ import traceback
 # to stay above main().
 from PyQt5.QtCore import Qt, QTimer, QPoint, QObject, pyqtSignal, QRect
 from PyQt5.QtGui import (QPainter, QPixmap, QColor, QFont, QCursor,
-                         QTransform, QFontMetrics, QPolygon, QFontDatabase,
-                         QIcon)
+                         QFontMetrics, QPolygon, QFontDatabase,
+                         QIcon, QImage)
 from PyQt5.QtWidgets import QApplication, QWidget, QMenu, QAction
 
 import ai_companion
 import pet_state
+import pet_sounds
+import pet_fx
 import screen_capture
+import wayland_capture
 from focus_timer import FocusWatcher, MODE_FOCUS
 
 try:
@@ -79,6 +82,8 @@ PET_WINDOW_TITLE = "desktop-pet-overlay"
 STATE_FILES = [
     "sit", "idle", "blink", "groom", "spook", "stalk", "walk",
     "run", "fly", "swat", "pat", "sleep", "climb", "drag",
+    "jump", "fall", "happy", "pet", "eat", "dizzy", "yawn", "dance",
+    "alert", "sulk",
 ]
 
 # ---- Animation: ticks between frame advances (main timer is 50ms = 20 FPS)
@@ -86,8 +91,43 @@ FRAME_SPEED = {
     "SIT": 12, "IDLE": 12, "WALK": 6, "RUN": 4, "SLEEP": 15, "GROOM": 8,
     "STALK": 7, "BLINK": 5, "SWAT": 4, "CLIMB": 5, "DRAG": 6, "FALL": 4,
     "PERCH": 12, "PAT": 3, "SPOOK": 4, "JUMP": 5, "POUNCE": 3, "CHASE": 4,
-    "LEAP": 6,
+    "LEAP": 6, "HAPPY": 4, "PETTED": 10, "EAT": 6, "DIZZY": 5, "DANCE": 6,
+    "ALERT": 6, "SULK": 14,
 }
+
+# One-shot states: play for a fixed number of ticks, then settle back down.
+# They are what turn a click, a treat or a shake into a visible reaction.
+ONE_SHOT_TICKS = {
+    "HAPPY": 32, "PETTED": 36, "EAT": 72, "DIZZY": 64, "DANCE": 120,
+    "ALERT": 18, "SULK": 60,
+}
+
+# Visual-only poses layered over a state for a few ticks (no FSM change):
+# the yawn as the pet nods off or wakes up, the crouch after a landing.
+YAWN_TICKS = 28
+LAND_SQUASH_TICKS = 4
+
+# Cursor flicks near the pet catch its attention.
+ALERT_RADIUS_PX = 170
+ALERT_SPEED_PX = 38         # px per tick of cursor travel
+ALERT_COOLDOWN_TICKS = 20 * 45
+# Dancing and other idle flourishes are rolled this rarely.
+DANCE_CHANCE = 0.03
+# Shaking the pet while dragging it: this many direction reversals within
+# SHAKE_WINDOW seconds makes it dizzy.
+SHAKE_REVERSALS = 5
+SHAKE_WINDOW = 1.4
+LASER_SECONDS = 30
+# Babble for lines the pet volunteers is rarer still than its ambient sounds.
+AMBIENT_BABBLE_CHANCE = 0.35
+# Characters revealed per tick in the speech bubble (typewriter effect).
+SPEECH_REVEAL_PER_TICK = 2
+# A spoken line counts as an answer to the user (and babbles reliably) if
+# the user did something this recently.
+USER_MOMENT_TICKS = 20 * 12
+# What a pat sounds like, per companion.
+PET_CUES = {"cat": "purr", "shiba": "pop", "ghost": "pop", "jarvis": "beep",
+            "ultron": "pop"}
 
 # ---- State durations, in ticks (20 ticks = 1s)
 STATE_MIN_DURATION = {
@@ -136,6 +176,7 @@ LEAP_GOAL_MAX_TICKS = 320
 ENERGY_DRAIN = {
     "WALK": 0.02, "STALK": 0.09, "RUN": 0.16, "CHASE": 0.18, "CLIMB": 0.07,
     "JUMP": 0.12, "POUNCE": 0.14, "SWAT": 0.05, "GROOM": 0.01,
+    "DANCE": 0.06, "HAPPY": 0.04,
 }
 ENERGY_GAIN_IDLE = 0.05     # sitting around
 ENERGY_GAIN_SLEEP = 0.55    # asleep
@@ -162,11 +203,19 @@ AI_CONTEXT_CHANCE = 0.35
 # changed, otherwise the "is anyone there" gate is satisfied forever.
 CURSOR_ACTIVITY_PX = 3
 
+# A drag release keeps its momentum: below FLING_MIN_SPEED it is a placement,
+# above that the pet is thrown (and lands with an in-character comment).
+FLING_MIN_SPEED = 1.5
+FLING_MAX_SPEED = 6.0
+
 SCALE_PRESETS = {
-    "1x (Small)": 1,
-    "2x (Medium)": 2,
-    "3x (Large)": 3,
-    "4x (Huge)": 4,
+    "1x (Tiny)": 1,
+    "2x (Small)": 2,
+    "3x (Medium)": 3,
+    "4x (Large)": 4,
+    "5x (Huge)": 5,
+    "6x (Giant)": 6,
+    "8x (Kaiju)": 8,
 }
 
 # FSM states that count as "exertion" for the purposes of chattiness.
@@ -179,7 +228,8 @@ SPEECH_MAX_LINES = 3
 SPEECH_PADDING_X = 10
 SPEECH_PADDING_Y = 6
 SPEECH_BUBBLE_RADIUS = 6
-SPEECH_TAIL_H = 4
+SPEECH_TAIL_H = 6
+SPEECH_PIXEL = 2   # the bubble's "art pixel", in screen pixels
 SPEECH_MIN_WIDTH = 60
 SPEECH_MAX_WIDTH = 220
 SPEECH_DISPLAY_TICKS = 80  # 4 seconds
@@ -600,13 +650,40 @@ class DesktopPet(QWidget):
         # interrupting: the pet hides for the duration.
         self._hidden_for_fullscreen = False
         self._capture_was_visible = False
-        self._screenshot_source = "auto"   # 'auto' | 'manual'
+        self._screenshot_source = "auto"   # 'auto' | 'manual' | 'local'
+        # "Shush..." (session-only snooze), 0 = not snoozed.
+        self._snoozed_until = 0
 
         # ---- interaction extras ----
         self.click_through = False
         self._treat_until_tick = 0
         self.tray = None
         self.tray_menu = None
+        self._drag_history = []
+        self.sounds = pet_sounds.PetSounds(
+            (ai_companion.CONFIG.get("audio") or {})
+            if ai_companion.CONFIG else {})
+
+        # ---- juice: particles, reactions, speech reveal ----
+        self.fx = None
+        try:
+            self.fx = pet_fx.PetFX(PET_WINDOW_TITLE)
+        except Exception:
+            log_exception("fx overlay")
+        self._squash_ticks = 0
+        self._yawn_until = 0
+        self._alert_ready_tick = 0
+        self._laser_until = 0
+        self._shake_times = []
+        self._shake_dir = 0
+        self._shaken = False
+        self._user_moment = -USER_MOMENT_TICKS
+        self._heart_seen = 0
+        self.speech_reveal = 0
+        self._state_before_press = None
+        self._state_timer_before_press = 0
+        self._suppress_release = False
+        self._user_drop = False
 
         # ---- focus / pomodoro awareness ----
         focus_cfg = self._settings().get("focus", {})
@@ -753,6 +830,32 @@ class DesktopPet(QWidget):
         except Exception:
             log_exception("state save")
 
+    def _check_milestone(self):
+        """Once per completed day of lifetime: one line, then wait a day.
+
+        Uses the accumulated lifetime counter, so the line shows up on the
+        anniversary of the pet's whole life together, not of a single session.
+        """
+        store = self.state_store
+        if store is None or companion_dialogue is None:
+            return
+        try:
+            alive = store.total_seconds_alive(time.time() - self.session_start)
+        except Exception:
+            return
+        days = int(alive // 86400)
+        if days <= int(store.data.get("milestone_days", 0)):
+            return
+        store.data["milestone_days"] = days
+        # Persist immediately: a crash five minutes after the anniversary must
+        # not let the same milestone repeat.
+        self._save_state(force=True)
+        if not self._quiet_now():
+            self.sounds.play("fanfare")   # it's a party, unless it's 3am
+        line = companion_dialogue.get_contextual_quote(
+            self.current_skin, event_type="milestone")
+        self.speak(line.replace("{days}", str(days)))
+
     def _screen_name(self):
         try:
             screen = self._screen_for_point(self.x_pos + self.sprite_w / 2,
@@ -875,18 +978,59 @@ class DesktopPet(QWidget):
         source = QPixmap(path)
         if source.isNull():
             return None
-        width = max(6, int(round(source.width() * self.scale_factor / 2.0)))
-        height = max(5, int(round(source.height() * self.scale_factor / 2.0)))
-        return source.scaled(width, height, Qt.KeepAspectRatio,
-                             Qt.FastTransformation)
+        # half the pet's pixel size, but always a whole multiple: the heart is
+        # pixel art too
+        factor = max(1, int(self.scale_factor) // 2)
+        return source.scaled(source.width() * factor, source.height() * factor,
+                             Qt.KeepAspectRatio, Qt.FastTransformation)
+
+    def _pixel_ratio(self):
+        """Integer device pixel ratio for pixel-perfect sprites.
+
+        On a 2x screen a 4x pet is drawn with 8 physical pixels per art pixel
+        instead of being upscaled again by the compositor. Fractional ratios
+        (1.25, 1.5) cannot be pixel-perfect, so they fall back to 1 and let
+        Qt place whole logical pixels.
+        """
+        try:
+            ratio = float(self.devicePixelRatioF())
+        except Exception:
+            ratio = 1.0
+        return int(ratio) if ratio >= 1.0 and ratio == int(ratio) else 1
 
     def _load_scaled(self, path):
-        pix = QPixmap(path)
-        if pix.isNull():
-            return pix
-        return pix.scaled(pix.width() * self.scale_factor,
-                          pix.height() * self.scale_factor,
-                          Qt.KeepAspectRatio, Qt.FastTransformation)
+        """A skin frame scaled by a whole number, nearest-neighbour.
+
+        Scaling goes through QImage at the exact multiple so every art pixel
+        becomes an identical N x N block -- no smoothing, no uneven columns.
+        """
+        image = QImage(path)
+        if image.isNull():
+            return QPixmap()
+        ratio = self._pixel_ratio()
+        factor = max(1, int(self.scale_factor)) * ratio
+        image = image.convertToFormat(QImage.Format_ARGB32_Premultiplied)
+        image = image.scaled(image.width() * factor, image.height() * factor,
+                             Qt.IgnoreAspectRatio, Qt.FastTransformation)
+        pix = QPixmap.fromImage(image)
+        pix.setDevicePixelRatio(ratio)
+        return pix
+
+    @staticmethod
+    def _logical_size(pix):
+        ratio = pix.devicePixelRatio() or 1.0
+        return int(round(pix.width() / ratio)), int(round(pix.height() / ratio))
+
+    @staticmethod
+    def _mirrored(pix):
+        """Horizontal mirror that keeps the device pixel ratio.
+
+        QPixmap.transformed() resets the ratio to 1, which on a HiDPI screen
+        draws every left-facing frame at double size.
+        """
+        out = QPixmap.fromImage(pix.toImage().mirrored(True, False))
+        out.setDevicePixelRatio(pix.devicePixelRatio())
+        return out
 
     def load_skin(self, skin_name):
         """Load every frame a skin has, and rebuild the frame lookup table."""
@@ -920,8 +1064,7 @@ class DesktopPet(QWidget):
 
         for frames in sprites.values():
             if frames:
-                self.sprite_w = frames[0].width()
-                self.sprite_h = frames[0].height()
+                self.sprite_w, self.sprite_h = self._logical_size(frames[0])
                 break
 
         self._build_frame_table()
@@ -951,11 +1094,21 @@ class DesktopPet(QWidget):
             "PERCH":  ["sit", "idle", "walk"],
             "PAT":    ["pat", "sit", "idle"],
             "SPOOK":  ["spook", "sit", "idle"],
-            "JUMP":   ["walk", "stalk", "climb", "sit"],
-            "POUNCE": ["swat", "stalk", "walk", "sit"],
+            "JUMP":   ["jump", "walk", "stalk", "climb", "sit"],
+            "POUNCE": ["jump", "swat", "stalk", "walk", "sit"],
             "CHASE":  ["run", "stalk", "walk", "sit"],
-            "LEAP":   ["climb", "walk", "stalk", "sit"],
+            "LEAP":   ["jump", "climb", "walk", "stalk", "sit"],
+            "HAPPY":  ["happy", "pat", "sit", "idle"],
+            "PETTED": ["pet", "happy", "sit", "idle"],
+            "EAT":    ["eat", "groom", "sit", "idle"],
+            "DIZZY":  ["dizzy", "drag", "sit", "idle"],
+            "DANCE":  ["dance", "happy", "pat", "sit", "idle"],
+            "ALERT":  ["alert", "sit", "idle"],
+            "SULK":   ["sulk", "sit", "idle"],
         }
+        # FALL prefers its own spread-eagle frames when the skin has them
+        if sprites.get("fall"):
+            fallbacks["FALL"] = ["fall"] + fallbacks["FALL"]
         table = {}
         for state, names in fallbacks.items():
             for name in names:
@@ -970,21 +1123,54 @@ class DesktopPet(QWidget):
     def get_frames(self):
         return self._frame_table.get(self.state) or []
 
+    AIRBORNE = ("JUMP", "POUNCE", "LEAP")
+
+    def _frame_choice(self):
+        """(cache key, frame list, index) for this tick.
+
+        Mostly "the state's frames, cycled", with a few poses chosen by what
+        the body is doing rather than by the clock: airborne frames follow
+        the velocity (launch going up, spread-eagle coming down), a landing
+        shows a crouch for a moment, and the first and last moments of a
+        nap show a yawn.
+        """
+        state = self.state
+        frames = self.get_frames()
+        speed = FRAME_SPEED.get(state, 6)
+        index = self.tick_count // speed
+        sprites = self.sprites
+        if state in self.AIRBORNE and sprites.get("jump"):
+            if self.vy < 0 or state == "LEAP" and self.leap_t < 2:
+                jump = sprites["jump"]
+                return "jump", jump, len(jump) - 1
+            fall = sprites.get("fall")
+            if fall:
+                return "fall", fall, index
+        if getattr(self, "_squash_ticks", 0) > 0 and sprites.get("jump") \
+                and state in ("SIT", "IDLE", "PERCH", "WALK"):
+            return "jump", sprites["jump"], 0
+        yawn = sprites.get("yawn")
+        if yawn and (state == "SLEEP" and self.state_timer < YAWN_TICKS
+                     or getattr(self, "_yawn_until", 0) > self.tick_count
+                     and state in ("SIT", "IDLE")):
+            elapsed = (self.state_timer if state == "SLEEP"
+                       else YAWN_TICKS - (self._yawn_until - self.tick_count))
+            step = max(1, YAWN_TICKS // len(yawn))
+            return "yawn", yawn, min(len(yawn) - 1, max(0, elapsed) // step)
+        return state, frames, index
+
     def get_current_frame(self):
         """Current frame, mirrored when facing left. No per-call allocation."""
-        frames = self.get_frames()
+        key, frames, index = self._frame_choice()
         if not frames:
             return None
-        speed = FRAME_SPEED.get(self.state, 6)
-        frame = frames[(self.tick_count // speed) % len(frames)]
         if self.facing < 0 and self.state != "CLIMB":
-            mirrored = self._flipped_cache.get(self.state)
-            if mirrored is None:
-                flip = QTransform().scale(-1, 1)
-                mirrored = [f.transformed(flip) for f in frames]
-                self._flipped_cache[self.state] = mirrored
-            frame = mirrored[(self.tick_count // speed) % len(mirrored)]
-        return frame
+            mirrored = self._flipped_cache.get(key)
+            if mirrored is None or len(mirrored) != len(frames):
+                mirrored = [self._mirrored(f) for f in frames]
+                self._flipped_cache[key] = mirrored
+            frames = mirrored
+        return frames[index % len(frames)]
 
     # =================================================================
     # Widget geometry
@@ -1029,15 +1215,40 @@ class DesktopPet(QWidget):
             return
         text = " ".join(str(text).split())[:SPEECH_MAX_CHARS]
         self.speech_text = text
-        self.speech_timer = SPEECH_DISPLAY_TICKS
         lines, width, height = _compute_bubble_geometry(text, self.speech_font)
         self.speech_lines = lines
         self.speech_bubble_w = width
         self.speech_bubble_h = height
+        # the bubble is sized for the whole line up front; the text types in
+        # (and the display time is extended by however long that takes)
+        self.speech_reveal = 0
+        reveal_ticks = len(text) // SPEECH_REVEAL_PER_TICK
+        self.speech_timer = SPEECH_DISPLAY_TICKS + reveal_ticks
+        self._babble(text)
         self._sync_widget_geometry()
+
+    def _mark_user_moment(self):
+        """The user just did something: the next line is an answer to them."""
+        self._user_moment = self.tick_count
+
+    def _babble(self, text):
+        """Voice the line: always when answering the user, rarely otherwise."""
+        sounds = getattr(self, "sounds", None)
+        if sounds is None:
+            return
+        try:
+            answering = self.tick_count - self._user_moment <= USER_MOMENT_TICKS
+            if answering:
+                sounds.say(text, self.current_skin)
+            elif not self._quiet_now() and not self.in_focus() \
+                    and random.random() < AMBIENT_BABBLE_CHANCE:
+                sounds.say(text, self.current_skin, ambient=True)
+        except Exception:
+            log_exception("babble")
 
     def _clear_speech(self):
         self.speech_text = ""
+        self.speech_reveal = 0
         self.speech_lines = []
         self.speech_bubble_w = 0
         self.speech_bubble_h = 0
@@ -1089,11 +1300,23 @@ class DesktopPet(QWidget):
         self.speak(get_system_status_quote(self.current_skin))
 
     def _quiet_now(self, now=None):
-        """Whether quiet hours are suppressing unsolicited chatter.
+        """Whether unsolicited chatter is being suppressed right now.
 
-        Only the pet's own initiative is muted: clicking Speak, petting it, or
-        asking for a look always answers.
+        Two switches: the daily `quiet_hours` window, and the session-only
+        snooze from the "Shush..." menu item (handy for a film or a call,
+        without having to edit config). Only the pet's own initiative is
+        muted: clicking Speak, petting it, or asking for a look always
+        answers. Opening the menu clears a snooze early.
         """
+        if now is None:
+            epoch = time.time()
+        else:
+            epoch = now
+        if self._snoozed_until and epoch < self._snoozed_until:
+            return True
+        if self._snoozed_until and epoch >= self._snoozed_until:
+            # Expired: clear it so the status line stops saying "snoozed".
+            self._snoozed_until = 0
         cfg = self._behaviour().get("quiet_hours") or {}
         if not cfg.get("enabled", False):
             return False
@@ -1104,7 +1327,7 @@ class DesktopPet(QWidget):
             return False
         if start is None or end is None:
             return False
-        current = time.localtime(now if now is not None else time.time())
+        current = time.localtime(epoch)
         minutes = current.tm_hour * 60 + current.tm_min
         if start == end:
             return False
@@ -1112,12 +1335,37 @@ class DesktopPet(QWidget):
             return start <= minutes < end
         return minutes >= start or minutes < end   # wraps midnight
 
-    def _speak_contextual(self, event_type):
+    def snooze_for(self, seconds):
+        """Shush unsolicited chatter for a while. 0 cancels."""
+        if seconds <= 0:
+            self._snoozed_until = 0
+            return
+        self._snoozed_until = time.time() + seconds
+        self._speak_contextual("snooze")
+
+    @guarded
+    def _menu_shush(self, minutes):
+        if minutes <= 0:
+            self.snooze_for(0)
+            self.speak("unshushed.")
+            return
+        self.snooze_for(minutes * 60)
+
+    def _snooze_status_text(self):
+        if not self._snoozed_until:
+            return ""
+        remaining = self._snoozed_until - time.time()
+        if remaining <= 0:
+            return ""
+        return "shushed for %d more min" % math.ceil(remaining / 60.0)
+
+    def _speak_contextual(self, event_type, **details):
         """Speak a canned line from the companion's dialogue table."""
         if companion_dialogue is None:
             return
-        self.speak(companion_dialogue.get_contextual_quote(
-            self.current_skin, event_type=event_type))
+        line = companion_dialogue.get_contextual_quote(
+            self.current_skin, event_type=event_type, **details)
+        self.speak(line)
 
     # =================================================================
     # Screenshots
@@ -1181,6 +1429,7 @@ class DesktopPet(QWidget):
         # file actually switches them off in the running pet.
         ai_companion.reload_config_if_changed()
         settings = ai_companion.screenshot_settings()
+        app = QApplication.instance()
 
         manual = bool(force)
         if not manual:
@@ -1197,18 +1446,34 @@ class DesktopPet(QWidget):
                 return
         else:
             if not ai_companion.ai_enabled():
-                # Nothing to send it to; don't grab the screen for no reason.
-                ai_companion.note_capture_decision("refused", "AI is off")
+                # No model to describe a JPEG to, but the capture policy still
+                # applies, the OCR pass is local, and a canned line keyed by
+                # what is on screen costs nothing. Nothing is transmitted.
+                self._look_locally(app, settings)
                 return
             if not ai_companion.reserve_forced_screenshot():
                 # The result of this used to be dropped, so a user-initiated
                 # capture ignored the daily cap entirely.
                 ai_companion.note_capture_decision("refused", "daily capture cap reached")
+                self.sounds.play("no")
                 self._speak_contextual("screenshot_blocked")
                 return
 
+        # Native Wayland: the compositor does not let us enumerate windows, so
+        # the blocklist cannot be honoured and prepare_capture refuses. The
+        # portal path covers the one legitimate manual case: the user asked,
+        # and the portal dialog makes THEM the privacy gate. Automatic
+        # captures never reach here -- the enabled gate above is hard.
+        if manual and window_tracker.wayland_session() and \
+                settings.get("wayland_portal", False):
+            ok, why = self._capture_via_portal(settings)
+            if not ok and why:
+                ai_companion.note_capture_decision("refused", why)
+                self.sounds.play("no")
+                self._speak_contextual("screenshot_blocked")
+            return
+
         self._screenshot_source = "manual" if manual else "auto"
-        app = QApplication.instance()
         self._hide_for_capture()
         try:
             image, reason = screen_capture.prepare_capture(
@@ -1232,16 +1497,33 @@ class DesktopPet(QWidget):
         screen_rect = self.screen_rect
         manual_flag = manual
 
+        threading.Thread(
+            target=self._capture_worker_for(image, manual=manual_flag,
+                                            skin=skin, quality=quality,
+                                            blocklist=blocklist,
+                                            ocr_config=ocr_config,
+                                            screen_rect=screen_rect),
+            name="screenshot", daemon=True).start()
+
+    def _capture_worker_for(self, image, manual, skin, quality, blocklist,
+                            ocr_config, screen_rect):
+        """The background half of a capture: scan, discard-or-encode, send.
+
+        Built as a closure over one already-grabbed image so both capture
+        front-ends (native grab, portal) share exactly one send policy.
+        """
+
         def worker():
             # QImage work: safe off the GUI thread, and this is where the
             # 100-800ms used to be spent freezing the pet.
             captured = False
             try:
-                screen_capture.redact(image, blocklist, screen_rect)
+                if screen_rect is not None:
+                    screen_capture.redact(image, blocklist, screen_rect)
                 allowed, why = screen_capture.scan_capture(image, ocr_config)
                 if not allowed:
-                    # Discard, do not send, do not keep: the whole point of the
-                    # filter is that this image never leaves the machine.
+                    # Discard, do not send, do not keep: the whole point of
+                    # the filter is that this image never leaves the machine.
                     ai_companion.note_capture_decision("discarded", why)
                     self._report_discarded_capture()
                     return
@@ -1251,14 +1533,80 @@ class DesktopPet(QWidget):
                     ai_companion.note_capture_decision("sent", "")
                     ai_companion.request_screenshot_comment(
                         skin, encoded, self.ai_bridge.line_ready.emit,
-                        manual=manual_flag)
+                        manual=manual)
             except Exception:
                 log_exception("screenshot worker")
             finally:
                 ai_companion.record_capture_attempt(captured)
                 self._screenshot_inflight = False
 
-        threading.Thread(target=worker, name="screenshot", daemon=True).start()
+        return worker
+
+    def _capture_via_portal(self, settings):
+        """A user-confirmed screenshot on native Wayland, via the portal.
+
+        Returns (started, reason). The result is asynchronous: the pet is
+        hidden while the compositor dialog is up, and the callback picks the
+        normal pipeline back up once the user has answered.
+        """
+        if wayland_capture.QT_DBUS_OK is False:
+            return False, "the portal needs QtDBus, which this PyQt5 lacks"
+        ok, why = wayland_capture.available()
+        if not ok:
+            return False, why
+        self._screenshot_source = "portal"
+        self._screenshot_inflight = True
+        self._hide_for_capture()
+
+        def on_result(image, reason):
+            self._show_after_capture()
+            if image is None:
+                self._screenshot_inflight = False
+                ai_companion.note_capture_decision("refused", reason or "cancelled")
+                if reason:
+                    self._speak_contextual("screenshot_blocked")
+                return
+            skin = self.current_skin
+            quality = int(settings.get("jpeg_quality", 70))
+            threading.Thread(
+                target=self._capture_worker_for(
+                    image, manual=True, skin=skin, quality=quality,
+                    blocklist=settings.get("blocklist", []),
+                    ocr_config=ai_companion.ocr_settings(),
+                    screen_rect=None),
+                name="portal-capture", daemon=True).start()
+
+        ok, why = wayland_capture.PortalScreenshot(on_result).request()
+        if not ok:
+            self._screenshot_inflight = False
+            return False, why
+
+    def _look_locally(self, app, settings):
+        """A Look At This with no model attached.
+
+        Same privacy gates (blocklist, fullscreen, Wayland guarantee), the grab
+        happens, and the OCR pass runs locally to pick a canned line keyed by
+        what the screen holds -- code, a wall of text, numbers, or nothing.
+        The image is then dropped: at no point in this flow is anything sent
+        anywhere, which is the difference between "describe" and "upload".
+        """
+        self._screenshot_source = "local"
+        self._hide_for_capture()
+        try:
+            image, reason = screen_capture.prepare_capture(
+                app, settings.get("blocklist", []), self.screen_rect)
+        finally:
+            self._show_after_capture()
+        if image is None:
+            ai_companion.note_capture_decision("refused", reason or "no capture")
+            if reason:
+                self._speak_contextual("screenshot_blocked")
+            return
+        # OCR on this thread too: one local pass, a fraction of a second, and
+        # it is what decides the category -- no image data is encoded at all.
+        topic = screen_capture.capture_topics(image, ai_companion.ocr_settings())
+        ai_companion.note_capture_decision("described locally", topic)
+        self._speak_contextual("local_look_%s" % topic)
 
     def _report_discarded_capture(self):
         """Tell the user a capture was dropped, from the GUI thread.
@@ -1275,6 +1623,7 @@ class DesktopPet(QWidget):
     def _on_notice(self, kind):
         """Side-channel notice from a worker (no model involved)."""
         if kind == "discarded":
+            self.sounds.play("no")
             self._speak_contextual("screenshot_blocked")
 
     # =================================================================
@@ -1550,6 +1899,29 @@ class DesktopPet(QWidget):
         if not self._is_on_ledge():
             self.y_pos = self.floor_y
 
+    # ---- one-shot reactions -------------------------------------------
+
+    def _start_one_shot(self, state):
+        """Play a reaction (HAPPY, EAT, DIZZY...) in place, then settle."""
+        if self.state in ("DRAG", "FALL", "CLIMB", "LEAP", "JUMP", "POUNCE"):
+            return False
+        self._enter_state(state)
+        return True
+
+    def _tick_one_shot(self):
+        if self.state_timer >= ONE_SHOT_TICKS.get(self.state, 40):
+            finished = self.state
+            self._finish_one_shot()
+            if finished == "EAT":
+                # a happy little hop once the snack is gone
+                self._start_one_shot("HAPPY")
+
+    def _finish_one_shot(self):
+        if self._is_on_ledge():
+            self._enter_state("PERCH")
+        else:
+            self._enter_sit()
+
     # =================================================================
     # Main loop
     # =================================================================
@@ -1560,7 +1932,8 @@ class DesktopPet(QWidget):
 
         # Cursor movement counts as activity.
         cursor = QCursor.pos()
-        if (cursor - self.last_cursor).manhattanLength() > CURSOR_ACTIVITY_PX:
+        cursor_step = (cursor - self.last_cursor).manhattanLength()
+        if cursor_step > CURSOR_ACTIVITY_PX:
             self.last_activity_tick = self.tick_count
         self.last_cursor = cursor
 
@@ -1591,18 +1964,95 @@ class DesktopPet(QWidget):
             if self.speech_timer == 0:
                 self._clear_speech()
 
+        if self.speech_text and self.speech_reveal < len(self.speech_text):
+            self.speech_reveal += SPEECH_REVEAL_PER_TICK
+
+        # a heart that was just asked for floats up from the pet
+        if self.heart_timer > self._heart_seen:
+            self._emit_fx("hearts")
+        self._heart_seen = self.heart_timer
         if self.heart_timer > 0:
             self.heart_timer -= 1
+            self._heart_seen = self.heart_timer
+
+        if self._squash_ticks > 0:
+            self._squash_ticks -= 1
 
         if not self.dragging and not self._hidden_for_fullscreen:
             self._update_fsm(cursor)
+            self._ambient_flourish(cursor, cursor_step)
             self.maybe_screenshot()
 
         if self.tick_count % SAVE_INTERVAL_TICKS == 0:
+            self._check_milestone()
             self._save_state()
 
         self._sync_widget_geometry()
         self.update()
+        self._tick_fx()
+
+    # =================================================================
+    # Particles and flourishes
+    # =================================================================
+
+    def _emit_fx(self, name):
+        if self.fx is not None:
+            try:
+                self.fx.burst(name)
+            except Exception:
+                log_exception("fx")
+
+    def _tick_fx(self):
+        if self.fx is None:
+            return
+        try:
+            self.fx.tick(max(1, int(self.scale_factor)), self.x(),
+                         self.y() + self._sprite_offset(),
+                         self.isVisible() and not self._hidden_for_fullscreen,
+                         self.facing)
+        except Exception:
+            log_exception("fx tick")
+
+    def _ambient_flourish(self, cursor, cursor_step):
+        """Small things the pet does on its own: Zzz, dust, sweat, notes,
+        and noticing a cursor that whips past it."""
+        t = self.tick_count
+        state = self.state
+        if state == "SLEEP" and self.state_timer > YAWN_TICKS \
+                and t % 34 == 0:
+            self._emit_fx("zzz")
+        elif state in ("RUN", "CHASE") and t % 5 == 0 and not self.is_ghost:
+            self._emit_fx("kick")
+            if self.energy < MOOD_SLEEPY_MAX + 10 and t % 40 == 0:
+                self._emit_fx("sweat")
+        elif state == "DANCE" and t % 12 == 0:
+            self._emit_fx("notes")
+        elif state == "EAT" and self.state_timer % 14 == 7:
+            self._emit_fx("crumbs" if not self.is_ghost else "sparkles")
+        elif state == "DIZZY" and self.state_timer == 1:
+            self._emit_fx("stars")
+        elif state == "SULK" and self.state_timer == 2:
+            self._emit_fx("anger")
+
+        if self._laser_until and t >= self._laser_until:
+            self._laser_until = 0
+            if state == "CHASE":
+                self._enter_sit()
+            self._speak_contextual("laser_end")
+
+        # a cursor flick close by: ears up, "!"
+        if state in ("SIT", "IDLE", "PERCH") and cursor_step > ALERT_SPEED_PX \
+                and t >= self._alert_ready_tick and not self._laser_until:
+            cx = self.x_pos + self.sprite_w / 2.0
+            cy = self.y_pos + self.sprite_h / 2.0
+            if math.hypot(cursor.x() - cx, cursor.y() - cy) < ALERT_RADIUS_PX:
+                self._alert_ready_tick = t + ALERT_COOLDOWN_TICKS
+                self.facing = 1 if cursor.x() >= cx else -1
+                self._start_one_shot("ALERT")
+                self._emit_fx("exclaim")
+                self.sounds.play("alert", ambient=True)
+                if random.random() < 0.25 and not self._quiet_now():
+                    self._speak_contextual("alert")
 
     # =================================================================
     # Environment awareness
@@ -1621,6 +2071,10 @@ class DesktopPet(QWidget):
                     self._behaviour().get("ignore_windows", []))
             except Exception:
                 log_exception("config: ignore list")
+        try:
+            self.sounds.update(ai_companion.CONFIG.get("audio") or {})
+        except Exception:
+            log_exception("config: audio")
         self._apply_click_through()
         self._refresh_screen_geometry()
 
@@ -1706,7 +2160,18 @@ class DesktopPet(QWidget):
             self._enter_state("SLEEP")
             return
 
-        if self.state in ("SIT", "IDLE"):
+        # The laser pointer game: anything calm turns into a chase.
+        if self._laser_until and not self.is_ghost and self.state in (
+                "SIT", "IDLE", "BLINK", "WALK", "GROOM", "STALK", "ALERT"):
+            if cursor_dx:
+                self.facing = 1 if cursor_dx > 0 else -1
+            if cursor_dist > 30:
+                self._enter_state("CHASE")
+                return
+
+        if self.state in ONE_SHOT_TICKS:
+            self._tick_one_shot()
+        elif self.state in ("SIT", "IDLE"):
             self._tick_idle(cursor_dx, cursor_dist)
         elif self.state == "BLINK":
             if self.state_timer > STATE_MIN_DURATION.get("BLINK", 6):
@@ -1733,8 +2198,14 @@ class DesktopPet(QWidget):
                           and still_away >= threshold)
             if not still_away and (self.state_timer > STATE_MAX_DURATION.get("SLEEP", 300)
                                    or cursor_dist < 30):
+                was_nap = self.state_timer > 25   # >1s asleep: a real nap
                 self.energy = min(100.0, self.energy + ENERGY_GAIN_WAKE)
                 self._enter_sit()
+                if was_nap:
+                    self._yawn_until = self.tick_count + YAWN_TICKS
+                    if not self._quiet_now() and random.random() < 0.3:
+                        self._speak_contextual("wake")
+                    self.sounds.play("wake", ambient=True)
 
     # ---- being alone ---------------------------------------------------
 
@@ -1807,6 +2278,16 @@ class DesktopPet(QWidget):
         # A tired pet sleeps, and a sleeping pet does not get excited.
         if self.energy < 15 or (mood == "sleepy" and random.random() < 0.35):
             self._enter_state("SLEEP")
+            self.sounds.play("yawn", ambient=True)
+            return
+
+        # A happy pet with energy to spare sometimes breaks into a dance.
+        if mood == "happy" and self.energy > 50 and not focusing \
+                and random.random() < DANCE_CHANCE * 4:
+            self._start_dance(user=False)
+            return
+        if not focusing and self.energy > 60 and random.random() < DANCE_CHANCE:
+            self._start_dance(user=False)
             return
 
         roll = random.random()
@@ -2162,17 +2643,22 @@ class DesktopPet(QWidget):
 
     def _tick_chase(self, cursor_dx, cursor_dist):
         """Sprint after the cursor, then pounce when close enough."""
+        laser = bool(self._laser_until)
         if cursor_dx != 0:
             self.facing = 1 if cursor_dx > 0 else -1
-        self.x_pos += self.facing * CHASE_SPEED
+        # the laser game is a sprint, and it stops dead under the dot
+        if laser and abs(cursor_dx) < 6:
+            return
+        self.x_pos += self.facing * (CHASE_SPEED * 1.35 if laser else CHASE_SPEED)
         if self._clamp_to_ledge():
             self._enter_sit()
             return
         if cursor_dist < 40:
             self._start_jump(toward=self.x_pos + self.facing * 10)
             self._enter_state("POUNCE")
+            self.sounds.play("pounce", ambient=not laser)
             return
-        if cursor_dist > 420 or self.state_timer > 220:
+        if not laser and (cursor_dist > 420 or self.state_timer > 220):
             self._enter_state("SIT")
             return
         # Clamp here as well as in the dispatcher: a state handler that is only
@@ -2265,6 +2751,7 @@ class DesktopPet(QWidget):
                 landing_y = self.floor_y
 
         if self.y_pos >= landing_y:
+            impact = self.vy
             self.y_pos = landing_y
             self.vy = 0.0
             self.vx = 0.0
@@ -2285,7 +2772,16 @@ class DesktopPet(QWidget):
                 self._enter_sit()
             event = self.land_event or ("drop" if announce else None)
             self.land_event = None
-            if event:
+            if impact > 4.0:
+                self._emit_fx("dust")
+                self._squash_ticks = LAND_SQUASH_TICKS
+            if event == "fling" or self._user_drop:
+                self.sounds.play("land")
+            self._user_drop = False
+            if self._shaken or (event == "fling" and impact >= TERMINAL_VEL
+                                and random.random() < 0.4):
+                self._get_dizzy()
+            elif event:
                 self._speak_contextual(event)
 
         low = float(self.screen_left)
@@ -2321,6 +2817,7 @@ class DesktopPet(QWidget):
 
         # Budget for the whole climb, measured once from where we started.
         self.climb_budget_ticks = self._climb_budget(edge)
+        self.sounds.play("climb", ambient=True)
         self._speak_contextual("climb")
         return True
 
@@ -2457,14 +2954,16 @@ class DesktopPet(QWidget):
     def paintEvent(self, _event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing, False)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, False)
 
         frame = self.get_current_frame()
         sprite_y = self._sprite_offset()
         if frame is not None:
             painter.drawPixmap(0, sprite_y, frame)
 
-        # Heart floats above the pet, and above the bubble when one is up.
-        if self.heart_timer > 0 and self.heart_pixmap is not None:
+        # Without the particle overlay, fall back to the static heart.
+        if self.fx is None and self.heart_timer > 0 \
+                and self.heart_pixmap is not None:
             hx = self.sprite_w // 2 - self.heart_pixmap.width() // 2
             top = sprite_y - self.heart_pixmap.height() + 6
             if self.speech_text and not self.speech_below:
@@ -2477,37 +2976,64 @@ class DesktopPet(QWidget):
         painter.end()
 
     def _paint_speech_bubble(self, painter):
+        """A pixel-art bubble: notched corners, chunky border, stepped tail.
+
+        The text types itself in, `speech_reveal` characters at a time; the
+        bubble itself is laid out for the whole line so it never resizes.
+        """
         painter.setFont(self.speech_font)
         metrics = painter.fontMetrics()
 
         width = self.speech_bubble_w
         body_h = self.speech_bubble_h - SPEECH_TAIL_H
         below = self.speech_below
+        u = SPEECH_PIXEL
 
         box_x = max(0, (self.width() - width) // 2)
         box_y = self.height() - body_h if below else 0
 
-        bubble_color = QColor(255, 255, 255, 235)
-        painter.setBrush(bubble_color)
-        painter.setPen(QColor(30, 24, 30))
-        painter.drawRoundedRect(box_x, box_y, width, body_h,
-                                SPEECH_BUBBLE_RADIUS, SPEECH_BUBBLE_RADIUS)
+        ink = QColor(34, 24, 38)
+        paper = QColor(255, 252, 244)
+        shade = QColor(226, 218, 206)
 
-        tail_x = box_x + width // 2
-        if below:
-            points = [QPoint(tail_x - 4, box_y), QPoint(tail_x + 4, box_y),
-                      QPoint(tail_x, box_y - SPEECH_TAIL_H)]
-        else:
-            points = [QPoint(tail_x - 4, box_y + body_h),
-                      QPoint(tail_x + 4, box_y + body_h),
-                      QPoint(tail_x, box_y + body_h + SPEECH_TAIL_H)]
-        painter.drawPolygon(QPolygon(points))
+        def block(x, y, w, h, colour):
+            painter.fillRect(QRect(int(x), int(y), int(w), int(h)), colour)
 
-        painter.setPen(QColor(30, 24, 30))
+        # border: a rectangle with its corner pixels knocked out
+        block(box_x + u, box_y, width - 2 * u, body_h, ink)
+        block(box_x, box_y + u, width, body_h - 2 * u, ink)
+        # paper, inset by one border pixel, corners notched again
+        block(box_x + 2 * u, box_y + u, width - 4 * u, body_h - 2 * u, paper)
+        block(box_x + u, box_y + 2 * u, width - 2 * u, body_h - 4 * u, paper)
+        # a soft shadow along the bottom inside edge
+        block(box_x + 2 * u, box_y + body_h - 2 * u, width - 4 * u, u, shade)
+
+        # stepped tail, pointing at the pet: rows of 5, 3, 1 pixels
+        steps = max(2, SPEECH_TAIL_H // u)
+        tail_w = (2 * steps - 1) * u
+        tail_x = box_x + max(2 * u, min(width - tail_w - 2 * u,
+                                        self.sprite_w // 2 - tail_w // 2))
+        for i in range(steps):
+            x = tail_x + i * u
+            w = tail_w - 2 * i * u
+            y = box_y - (i + 1) * u if below else box_y + body_h + i * u
+            block(x, y, w, u, ink)
+            if w > 2 * u:
+                block(x + u, y, w - 2 * u, u, paper)
+        # open the border where the tail joins
+        seam = box_y if below else box_y + body_h - u
+        block(tail_x + u, seam, tail_w - 2 * u, u, paper)
+
+        painter.setPen(ink)
         line_h = metrics.height()
         text_y = box_y + SPEECH_PADDING_Y + metrics.ascent()
+        remaining = self.speech_reveal if self.speech_reveal else 0
         for line in self.speech_lines:
-            painter.drawText(box_x + SPEECH_PADDING_X, int(text_y), line)
+            if remaining <= 0:
+                break
+            shown = line[:remaining]
+            remaining -= len(line) + 1
+            painter.drawText(box_x + SPEECH_PADDING_X, int(text_y), shown)
             text_y += line_h
 
     # =================================================================
@@ -2521,6 +3047,13 @@ class DesktopPet(QWidget):
         self.dragging = False
         self.drag_offset = event.globalPos() - self.pos()
         self.drag_start_y = self.y_pos
+        self._drag_history = [(time.time(), event.globalPos().x(),
+                               event.globalPos().y())]
+        self._state_before_press = self.state
+        self._state_timer_before_press = self.state_timer
+        self._shake_times = []
+        self._shake_dir = 0
+        self._shaken = False
         self._enter_state("DRAG")
         self.vy = 0.0
         # Grabbing a perched pet must clear the ledge, or the ground-lock and
@@ -2535,7 +3068,16 @@ class DesktopPet(QWidget):
             return
         target = event.globalPos() - self.drag_offset
         if (target - self.pos()).manhattanLength() > 4:
+            if not self.dragging:
+                self._mark_user_moment()
+                self.sounds.play("grab")
             self.dragging = True
+        self._track_shake(event.globalPos().x())
+        # Keep the last few cursor samples so a release can measure the throw.
+        self._drag_history.append((time.time(), event.globalPos().x(),
+                                   event.globalPos().y()))
+        if len(self._drag_history) > 8:
+            del self._drag_history[:-8]
         # Clamp into the *virtual desktop*: an unclamped drag could leave the
         # pet at y=-5000, which is a twenty second fall. The old clamp used
         # max(0, ...) and QDesktopWidget, so a monitor left of or above the
@@ -2547,6 +3089,25 @@ class DesktopPet(QWidget):
                                min(target.y() + bubble_h, bottom - self.sprite_h)))
         self._sync_widget_geometry()
         self.last_activity_tick = self.tick_count
+
+    def _track_shake(self, x):
+        """Count left/right reversals while dragging: shaken = dizzy."""
+        # called before this sample is appended: [-1] is the previous one
+        history = self._drag_history
+        if not history:
+            return
+        dx = x - history[-1][1]
+        if abs(dx) < 6:
+            return
+        direction = 1 if dx > 0 else -1
+        if self._shake_dir and direction != self._shake_dir:
+            now = time.time()
+            self._shake_times = [t for t in self._shake_times
+                                 if now - t <= SHAKE_WINDOW] + [now]
+            if len(self._shake_times) >= SHAKE_REVERSALS and not self._shaken:
+                self._shaken = True
+                self.sounds.play("shake")
+        self._shake_dir = direction
 
     def _virtual_desktop_rect(self):
         """Union of every connected screen, in Qt logical pixels."""
@@ -2574,13 +3135,37 @@ class DesktopPet(QWidget):
             return
         was_dragging = self.dragging
         self.dragging = False
+        if self._suppress_release:
+            # second release of a double-click: the trick already answered
+            self._suppress_release = False
+            if not was_dragging:
+                return
 
         if not was_dragging:
-            self.heart_timer = 20
+            self._mark_user_moment()
+            was_asleep = self._state_before_press == "SLEEP"
             self.energy = min(100.0, self.energy + ENERGY_GAIN_PET)
             self.petted_until_tick = self.tick_count
+            # A pet deserves attention: end a snooze early.
+            self._snoozed_until = 0
             event_type = (self.interaction.record_pet()
                           if self.interaction is not None else "pet_first")
+            if was_asleep and self._state_timer_before_press > 40:
+                # poked awake: a grumble, not a purr
+                self._enter_sit()
+                self._start_one_shot("SULK")
+                self.sounds.play("no")
+                self._speak_contextual("grumpy")
+                return
+            self.heart_timer = 20
+            if event_type == "pet_spam":
+                self._enter_sit()
+                self._start_one_shot("HAPPY")
+                self.sounds.play("happy")
+            else:
+                self._enter_sit()
+                self._start_one_shot("PETTED")
+                self.sounds.play(PET_CUES.get(self.current_skin, "pop"))
             if self.interaction is not None:
                 # A sleepy pet grumbles instead of engaging.
                 if self.mood() == "sleepy" and random.random() < 0.5:
@@ -2588,19 +3173,65 @@ class DesktopPet(QWidget):
                 self._speak_contextual(event_type)
             else:
                 self.request_dialogue()
-            self._enter_sit()
             return
 
+        # Dragged to a different monitor: the geometry signals only fire for
+        # monitor *changes* the window manager announces, not for a widget the
+        # user just carried across the seam and threw. Re-read which screen
+        # the pet is on before the arc decides where the floor is.
+        self._refresh_screen_geometry()
+
+        self._mark_user_moment()
         if self.is_ghost:
             # Resume hovering from wherever it was released, then ease back
             # down. The old code assigned y_pos and then immediately
             # overwrote it with the floor value, so it snapped instead.
             self.ghost_hover_y = self.y_pos
             self._enter_sit()
+            if self._shaken:
+                self._get_dizzy()
             return
 
-        self.vy = 0.0
+        vx, vy = self._fling_velocity()
         self._enter_fall()
+        self._user_drop = True
+        if vx is not None:
+            # _enter_fall zeroes the momentum (drops should not drift), and a
+            # throw is not a drop: the velocity is applied after the reset.
+            self.vx = vx
+            self.vy = vy
+            self.land_event = "fling"
+            self.sounds.play("whoosh")
+
+    def _fling_velocity(self):
+        """(vx, vy) in px/tick from the drag's last samples, or (None, None).
+
+        Releasing mid-drag used to dump the momentum: the cursor was moving
+        fast, the pet stopped dead, and a "thrown" pet fell like a dropped
+        one. Momentum is capped so the fling stays readable (and inside the
+        desktop), and a gentle release stays a plain drop.
+        """
+        history = self._drag_history
+        if len(history) < 2:
+            return None, None
+        (t0, x0, y0), (t1, x1, y1) = history[0], history[-1]
+        elapsed = t1 - t0
+        if elapsed <= 0:
+            return None, None
+        vx = (x1 - x0) / elapsed / TICKS_PER_SECOND
+        vy = (y1 - y0) / elapsed / TICKS_PER_SECOND
+        if abs(vx) < FLING_MIN_SPEED and abs(vy) < FLING_MIN_SPEED:
+            return None, None
+        vx = max(-FLING_MAX_SPEED, min(FLING_MAX_SPEED, vx))
+        # An upward throw rises; a downward throw just drops with intent. The
+        # negative side is capped so nobody can launch the pet into orbit.
+        vy = max(-FLING_MAX_SPEED, min(FLING_MAX_SPEED, vy))
+        # A sideways release at floor level reads as nothing on the ground, so
+        # give it a small hop: it visibly travels, then settles.
+        near_floor = abs(self.y_pos - self.floor_y) <= self.sprite_h
+        if near_floor and abs(vy) < FLING_MIN_SPEED:
+            vy = -2.5
+        return vx, vy
 
     # =================================================================
     # Context menu
@@ -2670,6 +3301,33 @@ class DesktopPet(QWidget):
         treat_action.triggered.connect(self._menu_treat)
         menu.addAction(treat_action)
 
+        play_menu = menu.addMenu("Play")
+        for label, handler, tip in (
+                ("Dance!", lambda: self._start_dance(user=True),
+                 "A little dance, with music"),
+                ("Do a Trick", self._do_trick,
+                 "Also: double-click the pet"),
+                ("Laser Pointer", self._menu_laser,
+                 "It chases your cursor for %d seconds" % LASER_SECONDS)):
+            action = QAction(label, self)
+            action.setToolTip(tip)
+            action.triggered.connect(handler)
+            play_menu.addAction(action)
+
+        self._build_sound_menu(menu)
+
+        shush_menu = menu.addMenu("Shush...")
+        for label, minutes in (("15 minutes", 15), ("1 hour", 60),
+                               ("2 hours", 120)):
+            action = QAction(label, self)
+            action.triggered.connect(
+                lambda _c=False, m=minutes: self._menu_shush(m))
+            shush_menu.addAction(action)
+        unshush = QAction("Unshush Now", self)
+        unshush.setEnabled(bool(self._snoozed_until))
+        unshush.triggered.connect(lambda: self._menu_shush(0))
+        shush_menu.addAction(unshush)
+
         self._build_privacy_menu(menu)
 
         personality_action = QAction("Edit Personality...", self)
@@ -2690,6 +3348,11 @@ class DesktopPet(QWidget):
         forget_action.triggered.connect(self._menu_forget)
         menu.addAction(forget_action)
 
+        memory_action = QAction("What Do You Remember?", self)
+        memory_action.setToolTip("Read back the facts the pet has kept")
+        memory_action.triggered.connect(self._menu_memory)
+        menu.addAction(memory_action)
+
         menu.addSeparator()
         stats = QAction(self._stats_text(), self)
         stats.setEnabled(False)
@@ -2708,6 +3371,40 @@ class DesktopPet(QWidget):
         quit_action.triggered.connect(self.shutdown)
         menu.addAction(quit_action)
         return menu
+
+    def _build_sound_menu(self, menu):
+        audio = ai_companion.CONFIG.setdefault("audio", {})
+        sound_menu = menu.addMenu("Sound")
+        self._add_toggle(sound_menu, "Sounds", self.sounds.enabled,
+                         lambda c: self._set_audio("enabled", bool(c)))
+        self._add_toggle(sound_menu, "Talking Voice", self.sounds.voice,
+                         lambda c: self._set_audio("voice", bool(c)))
+        ambient = self._add_toggle(
+            sound_menu, "Sounds On Its Own (rare)", self.sounds.ambient,
+            lambda c: self._set_audio("ambient", bool(c)))
+        ambient.setToolTip("Noises the pet makes without being touched. "
+                           "At most one every %d seconds."
+                           % int(self.sounds.ambient_gap))
+        sound_menu.addSeparator()
+        for label, level in (("Quiet", 0.15), ("Normal", 0.3), ("Loud", 0.55)):
+            action = QAction(label, self)
+            action.setCheckable(True)
+            action.setChecked(abs(float(audio.get("volume", 0.3)) - level) < 0.01)
+            action.triggered.connect(
+                lambda _c=False, v=level: self._set_audio("volume", v))
+            sound_menu.addAction(action)
+
+    def _set_audio(self, key, value):
+        """Change one audio setting, persist it, and play a sample."""
+        audio = ai_companion.CONFIG.setdefault("audio", {})
+        audio[key] = value
+        self.sounds.update(audio)
+        try:
+            ai_companion.save_config()
+        except Exception:
+            log_exception("save audio config")
+        if self.sounds.enabled:
+            self.sounds.play(self.sounds.voice_cue(self.current_skin))
 
     def _build_privacy_menu(self, menu):
         """Screens this pet is allowed to look at, and what happens to them."""
@@ -2868,11 +3565,18 @@ class DesktopPet(QWidget):
         hours, remainder = divmod(int(alive), 3600)
         minutes = remainder // 60
         age = ("%dh %02dm" % (hours, minutes)) if hours else "%dm" % minutes
+        total_days, remainder = divmod(int(alive), 86400)
+        total_hours = remainder // 3600
+        lifetime = ""
+        if total_days:
+            # The lifetime counter is what anniversaries use; the menu should
+            # not pretend the pet is new on every restart.
+            lifetime = " (%dd %dh old)" % (total_days, total_hours)
         pets = 0
         if self.interaction is not None:
             pets = len(getattr(self.interaction, "pets", []) or [])
-        return "alive %s - %d sessions - %d pets - %d treats" % (
-            age, data.get("pet_count", 0) or 0, pets,
+        return "alive %s%s - %d sessions - %d pets - %d treats" % (
+            age, lifetime, data.get("pet_count", 0) or 0, pets,
             data.get("treats_given", 0) or 0)
 
     def _menu_treat(self):
@@ -2888,7 +3592,54 @@ class DesktopPet(QWidget):
             current = self.state_store.data.get("treats_given", 0) or 0
             self.state_store.touch(treats_given=int(current) + 1)
             self.state_store.save(force=True)
-        self._speak_contextual("happy")
+        self._mark_user_moment()
+        self.sounds.play("eat")
+        if not self._start_one_shot("EAT"):
+            self.sounds.play("chime")
+        self._speak_contextual("treat")
+
+    # ---- play ----------------------------------------------------------
+
+    def _get_dizzy(self):
+        self._shaken = False
+        self._start_one_shot("DIZZY")
+        self.sounds.play("dizzy")
+        self._speak_contextual("dizzy")
+
+    def _start_dance(self, user=True):
+        if not self._start_one_shot("DANCE"):
+            return
+        if user:
+            self._mark_user_moment()
+        self.sounds.play("dance", ambient=not user)
+        if user or random.random() < 0.5:
+            self._speak_contextual("dance")
+
+    def _do_trick(self):
+        """A hop with a twirl: turns around mid-air and lands facing you."""
+        self._mark_user_moment()
+        if not self._start_one_shot("HAPPY"):
+            return
+        self.facing = -self.facing
+        self._emit_fx("sparkles")
+        self.sounds.play("jump")
+        self._speak_contextual("trick")
+
+    def _menu_laser(self):
+        self._mark_user_moment()
+        if self.is_ghost:
+            # ghosts drift after it instead of sprinting
+            self._enter_state("CHASE")
+        self._laser_until = self.tick_count + int(LASER_SECONDS * TICKS_PER_SECOND)
+        self.sounds.play("alert")
+        self._speak_contextual("laser")
+
+    @guarded
+    def mouseDoubleClickEvent(self, event):
+        if event.button() != Qt.LeftButton:
+            return
+        self._suppress_release = True
+        self._do_trick()
 
     def _set_movement_flag(self, name, checked):
         """Menu toggles that now survive a restart (they used to be memory-only)."""
@@ -2986,12 +3737,58 @@ class DesktopPet(QWidget):
 
     def _menu_forget(self):
         self.forget_state()
+        # "Forget Me" means start over: the stored click-through and position
+        # are gone, so the pet should not keep pretending they aren't.
+        self.click_through = False
+        self._apply_click_through()
+        self._reset_position()
         self._speak_contextual("greeting")
+
+    def _menu_memory(self):
+        """Read the pet's memory back to the user, read-only.
+
+        Deliberately read-only display: the memory file gets written by what
+        the model said in the MEMORY: line of a reply, and the only delete
+        action is the explicit "forget everything" button here.
+        """
+        from PyQt5.QtWidgets import QMessageBox
+
+        facts = ai_companion.memory_facts()
+        if facts:
+            body = "\n".join("- %s" % fact for fact in facts)
+        else:
+            body = ("Nothing yet. The pet keeps short facts about you as they "
+                    "come up (memory must be enabled in the config).")
+        box = QMessageBox(self)
+        box.setWindowTitle("What do you remember?")
+        box.setText("Facts I've kept (%s)" % len(facts))
+        box.setDetailedText(body)
+        box.setStandardButtons(QMessageBox.Ok)
+        if facts:
+            forget = box.addButton("Forget Everything", QMessageBox.DestructiveRole)
+        box.exec_()
+        if facts and box.clickedButton() == forget:
+            confirm = QMessageBox(self)
+            confirm.setWindowTitle("Forget everything")
+            confirm.setText(
+                "Erase the %d fact%s?\nThis does not touch anything else."
+                % (len(facts), "" if len(facts) == 1 else "s"))
+            confirm.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+            confirm.setDefaultButton(QMessageBox.No)
+            if confirm.exec_() == QMessageBox.Yes:
+                ai_companion.forget_memory()
+                self.speak("forgotten. clean slate.")
+            else:
+                self.speak("phew. keeping them.")
 
     def _status_text(self):
         status = ai_companion.ai_status()
         state = "AI on" if status["enabled"] else "AI off"
-        return "%s - %s" % (state, status["reason"])
+        text = "%s - %s" % (state, status["reason"])
+        shushed = self._snooze_status_text()
+        if shushed:
+            text += " | %s" % shushed
+        return text
 
     def _ai_problem(self):
         """Whether the model is configured but failing, so retry makes sense."""
@@ -3082,11 +3879,25 @@ class DesktopPet(QWidget):
         if QSystemTrayIcon is not None and reason == QSystemTrayIcon.Trigger:
             self._restack_on_top(force=True)
 
+    def hideEvent(self, event):
+        # the particles go wherever the pet goes, including out of a capture
+        if self.fx is not None:
+            try:
+                self.fx.hide()
+            except Exception:
+                pass
+        super().hideEvent(event)
+
     def shutdown(self):
         """Stop the poller, save state, and quit cleanly."""
         try:
             self.timer.stop()
             self._save_state(force=True)
+            if self.fx is not None:
+                try:
+                    self.fx.close()
+                except Exception:
+                    pass
             if self.tray is not None:
                 try:
                     self.tray.hide()
