@@ -142,12 +142,14 @@ class Particle:
 class PetFX(QWidget):
     """Click-through particle layer that shadows the pet's position."""
 
-    def __init__(self, title="desktop-pet-overlay"):
+    def __init__(self, title="desktop-pet-overlay", bypass=False):
         super().__init__()
         self.setWindowTitle(title)
-        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint
-                            | Qt.Tool | Qt.WindowTransparentForInput
-                            | Qt.WindowDoesNotAcceptFocus)
+        flags = (Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
+                 | Qt.WindowTransparentForInput | Qt.WindowDoesNotAcceptFocus)
+        if bypass:
+            flags |= Qt.X11BypassWindowManagerHint
+        self.setWindowFlags(flags)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_NoSystemBackground)
         self.setAttribute(Qt.WA_TransparentForMouseEvents)
@@ -221,6 +223,21 @@ class PetFX(QWidget):
                           vy=r(-0.8, -0.2), gravity=0.08, life=12)
         elif name == "anger":
             self.emit("anger", 12, 0, life=24, wobble=0.1, fade=False)
+        elif name == "spark":
+            # thruster sparks trailing a flying robot
+            self.emit("spark", 8 + r(-1, 1), 15, vx=-self.facing * 0.2,
+                      vy=0.35, life=7)
+        elif name == "sniff":
+            nose = 8 + self.facing * 7
+            self.emit("dust_s", nose, 14, vx=self.facing * 0.2, vy=-0.2,
+                      life=8)
+        elif name == "thud":
+            # a heavy landing: a wide, low dust cloud
+            for i in range(6):
+                side = -1 if i % 2 else 1
+                self.emit("dust", 8 + side * (2 + i), 14,
+                          vx=side * r(0.4, 0.9), vy=r(-0.35, -0.1),
+                          life=14 + i)
         elif name == "puff":
             for _ in range(5):
                 self.emit("cloud", r(2, 12), r(4, 12), vx=r(-0.3, 0.3),
@@ -250,6 +267,7 @@ class PetFX(QWidget):
             self.move(x, y)
         if not self.isVisible():
             self.show()
+            self.raise_()
         self.update()
 
     def paintEvent(self, _event):

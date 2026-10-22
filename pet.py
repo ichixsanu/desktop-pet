@@ -43,6 +43,7 @@ import ai_companion
 import pet_state
 import pet_sounds
 import pet_fx
+import pet_personality as persona
 import screen_capture
 import wayland_capture
 from focus_timer import FocusWatcher, MODE_FOCUS
@@ -92,15 +93,36 @@ FRAME_SPEED = {
     "STALK": 7, "BLINK": 5, "SWAT": 4, "CLIMB": 5, "DRAG": 6, "FALL": 4,
     "PERCH": 12, "PAT": 3, "SPOOK": 4, "JUMP": 5, "POUNCE": 3, "CHASE": 4,
     "LEAP": 6, "HAPPY": 4, "PETTED": 10, "EAT": 6, "DIZZY": 5, "DANCE": 6,
-    "ALERT": 6, "SULK": 14,
+    "ALERT": 6, "SULK": 14, "FLY": 6, "HAUNT": 7, "PHASE": 4, "ZOOMIES": 3,
+    "SNIFF": 9, "SPIN": 4, "FOLLOW": 6,
 }
 
 # One-shot states: play for a fixed number of ticks, then settle back down.
 # They are what turn a click, a treat or a shake into a visible reaction.
 ONE_SHOT_TICKS = {
     "HAPPY": 32, "PETTED": 36, "EAT": 72, "DIZZY": 64, "DANCE": 120,
-    "ALERT": 18, "SULK": 60,
+    "ALERT": 18, "SULK": 60, "SPOOK": 30, "PAT": 40,
 }
+
+# Chasing: lined up with the cursor means within this many px; inside it the
+# pet stops turning (no flip-flopping on the spot).
+STEER_DEADZONE = 10
+# How far above the pet a pounce can reach.
+POUNCE_REACH_PX = 70
+
+# Free-flight and personality states (see pet_personality.py)
+FLY_MAX_TICKS = 420
+HAUNT_TICKS = 220
+HAUNT_DISTANCE = 85
+PHASE_TICKS = 28
+ZOOMIES_SPEED = 5.2
+SNIFF_TICKS = 170
+SPIN_TICKS = 30
+FOLLOW_TICKS = 240
+# A flyer's cruising band, as fractions of the screen height from the top.
+FLY_BAND = {"ghost": (0.15, 1.0), "jarvis": (0.35, 1.0)}
+# Coming back to the machine after this long away gets a welcome.
+WELCOME_AWAY_SECONDS = 120
 
 # Visual-only poses layered over a state for a few ticks (no FSM change):
 # the yawn as the pet nods off or wakes up, the crouch after a landing.
@@ -176,7 +198,8 @@ LEAP_GOAL_MAX_TICKS = 320
 ENERGY_DRAIN = {
     "WALK": 0.02, "STALK": 0.09, "RUN": 0.16, "CHASE": 0.18, "CLIMB": 0.07,
     "JUMP": 0.12, "POUNCE": 0.14, "SWAT": 0.05, "GROOM": 0.01,
-    "DANCE": 0.06, "HAPPY": 0.04,
+    "DANCE": 0.06, "HAPPY": 0.04, "ZOOMIES": 0.22, "FOLLOW": 0.04,
+    "SNIFF": 0.02, "HAUNT": 0.05, "FLY": 0.02,
 }
 ENERGY_GAIN_IDLE = 0.05     # sitting around
 ENERGY_GAIN_SLEEP = 0.55    # asleep
@@ -195,6 +218,7 @@ SAVE_INTERVAL_TICKS = 600   # 30s at 20 FPS
 # fullscreen state is looked at (1s).
 CONFIG_RELOAD_TICKS = 100
 FULLSCREEN_CHECK_TICKS = 20
+RAISE_TICKS = 40
 TICKS_PER_SECOND = 20.0
 # A context line is handed to the model at most this often, and only when the
 # idle rate-limit pool agrees.
@@ -506,6 +530,33 @@ def discover_skins():
         return []
 
 
+def strong_on_top():
+    """Whether to use an unmanaged (override-redirect) window on X11.
+
+    A managed "always on top" window still loses to a focused fullscreen
+    window in Mutter/Muffin/KWin's stacking layers -- the pet vanished behind
+    every fullscreen video. An unmanaged window sits above all of them. Set
+    behaviour.always_on_top to "normal" to go back to the managed kind.
+    """
+    try:
+        mode = ai_companion.general_settings().get("behaviour", {}).get(
+            "always_on_top", "strong")
+    except Exception:
+        mode = "strong"
+    app = QApplication.instance()
+    platform = app.platformName() if app is not None else ""
+    return mode == "strong" and platform == "xcb"
+
+
+def window_flags(click_through=False):
+    flags = Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
+    if strong_on_top():
+        flags |= Qt.X11BypassWindowManagerHint
+    if click_through:
+        flags |= Qt.WindowTransparentForInput
+    return flags
+
+
 def _parse_clock(text):
     """'23:00' -> 1380 minutes past midnight, or None."""
     try:
@@ -528,7 +579,7 @@ class DesktopPet(QWidget):
     def __init__(self, skin="cat", scale=2):
         super().__init__()
         self.setWindowTitle(PET_WINDOW_TITLE)
-        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+        self.setWindowFlags(window_flags(False))
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_NoSystemBackground)
         self.setFocusPolicy(Qt.NoFocus)
@@ -599,6 +650,8 @@ class DesktopPet(QWidget):
 
         # ---- skin flags / hover ----
         self.is_ghost = self.current_skin == "ghost"
+        self.flies = persona.flies(self.current_skin)
+        self.profile = persona.profile(self.current_skin)
         self.ghost_hover_y = self.floor_y - 6.0
 
         # ---- climbing / perching ----
@@ -667,7 +720,7 @@ class DesktopPet(QWidget):
         # ---- juice: particles, reactions, speech reveal ----
         self.fx = None
         try:
-            self.fx = pet_fx.PetFX(PET_WINDOW_TITLE)
+            self.fx = pet_fx.PetFX(PET_WINDOW_TITLE, bypass=strong_on_top())
         except Exception:
             log_exception("fx overlay")
         self._squash_ticks = 0
@@ -684,6 +737,16 @@ class DesktopPet(QWidget):
         self._state_timer_before_press = 0
         self._suppress_release = False
         self._user_drop = False
+
+        # ---- personality ----
+        self.chooser = persona.Chooser()
+        self._next_action = None        # a follow-up the last action asked for
+        self._last_explore_tick = 0
+        self._fly_x = self._fly_y = 0.0
+        self._zoom_laps = 0
+        self._cursor = QPoint(0, 0)
+        self._heavy_landing = False
+        self._was_away = False
 
         # ---- focus / pomodoro awareness ----
         focus_cfg = self._settings().get("focus", {})
@@ -906,8 +969,13 @@ class DesktopPet(QWidget):
         if screen is not None and not screen.geometry().contains(
                 int(self.x_pos + self.sprite_w / 2), int(self.y_pos + self.sprite_h / 2)):
             self._reset_position()
-        if self.is_ghost:
-            self.ghost_hover_y = self.floor_y - 6.0
+        if self.flies:
+            # keep a flyer's cruising height on this screen (a geometry
+            # refresh happens every few seconds; it must not ground it)
+            self.ghost_hover_y = max(float(self.screen_top),
+                                     min(getattr(self, "ghost_hover_y",
+                                                 self.floor_y),
+                                         self.floor_y - 6.0))
         self._sync_widget_geometry()
 
     def _bind_screen_signals(self):
@@ -1060,6 +1128,10 @@ class DesktopPet(QWidget):
         self.sprites = sprites
         self.current_skin = skin_name
         self.is_ghost = skin_name == "ghost"
+        self.flies = persona.flies(skin_name)
+        self.profile = persona.profile(skin_name)
+        if getattr(self, "chooser", None) is not None:
+            self.chooser.forget()
         self._flipped_cache = {}
 
         for frames in sprites.values():
@@ -1069,7 +1141,7 @@ class DesktopPet(QWidget):
 
         self._build_frame_table()
         self._refresh_screen_geometry()
-        if self.is_ghost:
+        if self.flies:
             self.ghost_hover_y = self.floor_y - 6.0
         # Rebuild the heart at the new scale: 16px art next to a 4x pet used to
         # look like a speck.
@@ -1105,6 +1177,13 @@ class DesktopPet(QWidget):
             "DANCE":  ["dance", "happy", "pat", "sit", "idle"],
             "ALERT":  ["alert", "sit", "idle"],
             "SULK":   ["sulk", "sit", "idle"],
+            "FLY":    ["fly", "walk", "idle", "sit"],
+            "HAUNT":  ["fly", "walk", "idle", "sit"],
+            "PHASE":  ["spook", "idle", "sit"],
+            "ZOOMIES": ["run", "walk", "sit"],
+            "SNIFF":  ["stalk", "walk", "sit"],
+            "SPIN":   ["sit", "idle"],
+            "FOLLOW": ["walk", "fly", "sit"],
         }
         # FALL prefers its own spread-eagle frames when the skin has them
         if sprites.get("fall"):
@@ -1398,10 +1477,7 @@ class DesktopPet(QWidget):
         try:
             if not force and not self.isVisible():
                 return
-            flags = (Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
-            if self.click_through:
-                flags |= Qt.WindowTransparentForInput
-            self.setWindowFlags(flags)
+            self.setWindowFlags(window_flags(self.click_through))
             self.setAttribute(Qt.WA_TranslucentBackground)
             self.setAttribute(Qt.WA_ShowWithoutActivating)
             self.show()
@@ -1947,6 +2023,12 @@ class DesktopPet(QWidget):
         if self.tick_count % FULLSCREEN_CHECK_TICKS == 0:
             self._check_fullscreen()
 
+        # Re-assert the top of the stack every couple of seconds: a window
+        # that maps later (or another overlay) can land above the pet.
+        if self.tick_count % RAISE_TICKS == 0 and self.isVisible() \
+                and not self.dragging and QApplication.activePopupWidget() is None:
+            self.raise_()
+
         if self.tick_count % CONTEXT_CHECK_INTERVAL == 0:
             self._check_window_context()
 
@@ -2013,6 +2095,39 @@ class DesktopPet(QWidget):
         except Exception:
             log_exception("fx tick")
 
+    def _check_welcome_back(self):
+        """The user comes back after a while away: the pet notices.
+
+        A shiba loses its mind, a robot reports in, a cat... looks up.
+        """
+        if self.tick_count % 20:
+            return
+        idle = self._user_idle_seconds()
+        if idle is None:
+            return
+        if idle >= WELCOME_AWAY_SECONDS:
+            self._was_away = True
+            return
+        if not self._was_away or idle > 5:
+            return
+        self._was_away = False
+        if self.state in ("DRAG", "FALL", "LEAP", "JUMP", "CLIMB", "SLEEP"):
+            return
+        skin = self.current_skin
+        self._face_cursor(self._cursor.x() - (self.x_pos + self.sprite_w / 2.0))
+        if skin == "shiba":
+            self._start_one_shot("HAPPY")
+            self.sounds.play("bark", ambient=True)
+        elif skin in ("jarvis", "ultron"):
+            self._start_one_shot("ALERT")
+            self.sounds.play(self.sounds.voice_cue(skin), ambient=True)
+        elif skin == "ghost":
+            self._start_one_shot("PAT")
+        else:
+            self._enter_state("IDLE")       # a cat merely acknowledges you
+        if not self._quiet_now() and random.random() < 0.6:
+            self._speak_contextual("greeting")
+
     def _ambient_flourish(self, cursor, cursor_step):
         """Small things the pet does on its own: Zzz, dust, sweat, notes,
         and noticing a cursor that whips past it."""
@@ -2021,18 +2136,40 @@ class DesktopPet(QWidget):
         if state == "SLEEP" and self.state_timer > YAWN_TICKS \
                 and t % 34 == 0:
             self._emit_fx("zzz")
-        elif state in ("RUN", "CHASE") and t % 5 == 0 and not self.is_ghost:
+        elif state in ("RUN", "CHASE", "ZOOMIES") and t % 5 == 0 \
+                and not self.flies:
             self._emit_fx("kick")
             if self.energy < MOOD_SLEEPY_MAX + 10 and t % 40 == 0:
                 self._emit_fx("sweat")
         elif state == "DANCE" and t % 12 == 0:
             self._emit_fx("notes")
         elif state == "EAT" and self.state_timer % 14 == 7:
-            self._emit_fx("crumbs" if not self.is_ghost else "sparkles")
+            self._emit_fx("sparkles" if self.is_ghost else
+                          "sparks" if self.flies or self.current_skin == "ultron"
+                          else "crumbs")
         elif state == "DIZZY" and self.state_timer == 1:
             self._emit_fx("stars")
         elif state == "SULK" and self.state_timer == 2:
             self._emit_fx("anger")
+        elif state == "WALK" and self.profile.get("heavy") and t % 12 == 0:
+            self._emit_fx("kick")           # every step lands with a thud
+        elif state == "SNIFF" and self.state_timer % 44 == 30:
+            self._emit_fx("question" if random.random() < 0.15 else "sniff")
+        elif state == "FLY" and self.current_skin == "jarvis" and t % 6 == 0:
+            self._emit_fx("spark")
+
+        self._check_welcome_back()
+
+        # a ghost gets spooky when the cursor creeps up on it
+        if self.is_ghost and state in ("IDLE", "SIT") and \
+                t >= self._alert_ready_tick:
+            cx = self.x_pos + self.sprite_w / 2.0
+            cy = self.y_pos + self.sprite_h / 2.0
+            if math.hypot(cursor.x() - cx, cursor.y() - cy) < 45:
+                self._alert_ready_tick = t + ALERT_COOLDOWN_TICKS
+                self._start_one_shot("SPOOK")
+                self.sounds.play("boo", ambient=True)
+                return
 
         if self._laser_until and t >= self._laser_until:
             self._laser_until = 0
@@ -2108,6 +2245,10 @@ class DesktopPet(QWidget):
     def _update_fsm(self, cursor):
         self.state_timer += 1
         self._drain_energy()
+        try:
+            self._cursor = QPoint(int(cursor.x()), int(cursor.y()))
+        except Exception:
+            pass
 
         center_x = self.x_pos + self.sprite_w / 2.0
         center_y = self.y_pos + self.sprite_h / 2.0
@@ -2135,8 +2276,9 @@ class DesktopPet(QWidget):
             self._tick_jump()
             return
 
-        if self.is_ghost:
-            hover = self.ghost_hover_y + math.sin(self.tick_count / 25.0) * 5.0
+        if self.flies:
+            bob = 5.0 if self.is_ghost else 2.0
+            hover = self.ghost_hover_y + math.sin(self.tick_count / 25.0) * bob
             self.y_pos += (hover - self.y_pos) * 0.15
         elif not self._is_on_ledge():
             self.y_pos = self.floor_y
@@ -2160,17 +2302,40 @@ class DesktopPet(QWidget):
             self._enter_state("SLEEP")
             return
 
-        # The laser pointer game: anything calm turns into a chase.
-        if self._laser_until and not self.is_ghost and self.state in (
-                "SIT", "IDLE", "BLINK", "WALK", "GROOM", "STALK", "ALERT"):
-            if cursor_dx:
+        # The laser pointer game: anything calm turns into a chase (flyers
+        # glide after it instead).
+        if self._laser_until and self.state in (
+                "SIT", "IDLE", "BLINK", "WALK", "GROOM", "STALK", "ALERT",
+                "FLY", "SNIFF", "FOLLOW"):
+            if abs(cursor_dx) > STEER_DEADZONE:
                 self.facing = 1 if cursor_dx > 0 else -1
-            if cursor_dist > 30:
-                self._enter_state("CHASE")
+            # only give chase when there is somewhere to run to; a dot
+            # straight overhead gets watched, not run at on the spot
+            if self.flies and cursor_dist > 30 or \
+                    abs(cursor_dx) > STEER_DEADZONE * 3:
+                self._enter_state("HAUNT" if self.flies else "CHASE")
                 return
 
         if self.state in ONE_SHOT_TICKS:
             self._tick_one_shot()
+        elif self.state == "FLY":
+            self._tick_fly()
+        elif self.state == "HAUNT":
+            self._tick_haunt(cursor_dx, cursor_dist)
+        elif self.state == "PHASE":
+            self._tick_phase()
+        elif self.state == "ZOOMIES":
+            self._tick_zoomies()
+        elif self.state == "SNIFF":
+            self._tick_sniff()
+        elif self.state == "SPIN":
+            if self.state_timer % 5 == 0:
+                self.facing = -self.facing
+            if self.state_timer >= SPIN_TICKS:
+                self._enter_state("SLEEP")
+                self.sounds.play("yawn", ambient=True)
+        elif self.state == "FOLLOW":
+            self._tick_follow(cursor_dx, cursor_dist)
         elif self.state in ("SIT", "IDLE"):
             self._tick_idle(cursor_dx, cursor_dist)
         elif self.state == "BLINK":
@@ -2207,6 +2372,116 @@ class DesktopPet(QWidget):
                         self._speak_contextual("wake")
                     self.sounds.play("wake", ambient=True)
 
+    # ---- personality states --------------------------------------------
+
+    def _tick_fly(self):
+        """Free flight to (_fly_x, _fly_y): glide, ease in, settle."""
+        dx = self._fly_x - self.x_pos
+        speed = float(self.profile.get("walk_speed", 1.5))
+        step = min(speed, abs(dx) * 0.08 + 0.35)
+        if abs(dx) > 1.0:
+            self.facing = 1 if dx > 0 else -1
+            self.x_pos += self.facing * step
+        self.ghost_hover_y = self._fly_y
+        arrived = abs(dx) <= 1.5 and abs(self.y_pos - self._fly_y) < 6
+        if arrived or self.state_timer > FLY_MAX_TICKS:
+            self._enter_sit()
+
+    def _tick_haunt(self, cursor_dx, cursor_dist):
+        """Drift after the cursor, keeping a spooky distance; boo if caught."""
+        cursor = self._cursor
+        laser = bool(self._laser_until)
+        # Pick a side of the cursor and keep it; re-deciding every tick made
+        # the target jump across the cursor and back, so it never arrived.
+        if self.state_timer <= 1 or not getattr(self, "_haunt_side", 0) \
+                or abs(cursor_dx) > HAUNT_DISTANCE * 3:
+            self._haunt_side = -1 if cursor_dx > 0 else 1
+        side = self._haunt_side
+        gap = 20 if laser else HAUNT_DISTANCE
+        target_x = cursor.x() + side * gap - self.sprite_w / 2.0
+        top, bottom = self._fly_band()
+        self.ghost_hover_y = max(top, min(bottom, cursor.y() - self.sprite_h / 2.0))
+        dx = target_x - self.x_pos
+        speed = float(self.profile.get("walk_speed", 1.4)) * (2.0 if laser else 0.9)
+        if abs(dx) > 2:
+            self.x_pos += (1 if dx > 0 else -1) * min(speed, abs(dx))
+        self.facing = -side          # looking at the cursor from its side
+        if not laser and cursor_dist < 50 and self.is_ghost:
+            self._start_one_shot("SPOOK")
+            self._emit_fx("exclaim")
+            self.sounds.play("boo", ambient=True)
+            return
+        if not laser and self.state_timer > HAUNT_TICKS:
+            self._enter_sit()
+
+    def _tick_phase(self):
+        """Fade out in a puff, reappear somewhere else in another."""
+        t = self.state_timer
+        if t == 1:
+            self._emit_fx("puff")
+        elif t == PHASE_TICKS // 2:
+            top, bottom = self._fly_band()
+            low = float(self.screen_left)
+            high = float(self.screen_left + self.screen_w - self.sprite_w)
+            self.x_pos = random.uniform(low, high)
+            self.ghost_hover_y = self.y_pos = random.uniform(top, bottom)
+            self._emit_fx("puff")
+        elif t >= PHASE_TICKS:
+            self._enter_sit()
+
+    def phased_out(self):
+        return self.state == "PHASE" and 2 <= self.state_timer < PHASE_TICKS // 2 + 2
+
+    def _tick_zoomies(self):
+        """Flat-out sprint, edge to edge, a few laps."""
+        self.x_pos += self.facing * ZOOMIES_SPEED
+        low = float(self.screen_left)
+        high = float(self.screen_left + self.screen_w - self.sprite_w)
+        hit = self._clamp_to_ledge()
+        if self.x_pos <= low or self.x_pos >= high:
+            self.x_pos = max(low, min(high, self.x_pos))
+            hit = True
+        if hit or self.state_timer % 90 == 0:
+            self.facing = -self.facing
+            self._zoom_laps -= 1
+            self._emit_fx("dust")
+        if self._zoom_laps <= 0 or self.state_timer > 400:
+            self._enter_sit()
+
+    def _tick_sniff(self):
+        """Nose to the floor: shuffle, stop, sniff, maybe turn around."""
+        phase = self.state_timer % 44
+        if phase < 28:
+            self.x_pos += self.facing * 0.7
+        elif phase == 43 and random.random() < 0.35:
+            self.facing = -self.facing
+        low = float(self.screen_left)
+        high = float(self.screen_left + self.screen_w - self.sprite_w)
+        if self._clamp_to_ledge() or not low < self.x_pos < high:
+            self.x_pos = max(low, min(high, self.x_pos))
+            self.facing = -self.facing
+        if self.state_timer > SNIFF_TICKS:
+            self._enter_sit()
+
+    def _tick_follow(self, cursor_dx, cursor_dist):
+        """Trot over to wherever you are and sit there, looking up."""
+        if abs(cursor_dx) < 40:
+            self._face_cursor(cursor_dx)
+            self._enter_sit()
+            if random.random() < 0.3:
+                self._start_one_shot("HAPPY")
+            return
+        self._face_cursor(cursor_dx)
+        self.x_pos += self.facing * float(self.profile.get("walk_speed", 1.5)) * 1.2
+        low = float(self.screen_left)
+        high = float(self.screen_left + self.screen_w - self.sprite_w)
+        if self._clamp_to_ledge() or not low <= self.x_pos <= high:
+            self.x_pos = max(low, min(high, self.x_pos))
+            self._enter_sit()
+            return
+        if self.state_timer > FOLLOW_TICKS:
+            self._enter_sit()
+
     # ---- being alone ---------------------------------------------------
 
     def _idle_sleep_seconds(self):
@@ -2240,7 +2515,8 @@ class DesktopPet(QWidget):
         if self.state == "SLEEP":
             return False
         if self.state not in ("SIT", "IDLE", "BLINK", "GROOM", "WALK", "STALK",
-                              "SWAT", "CHASE", "RUN"):
+                              "SWAT", "CHASE", "RUN", "SNIFF", "FOLLOW",
+                              "FLY", "HAUNT", "ZOOMIES"):
             return False
         idle = self._user_idle_seconds()
         return idle is not None and idle >= threshold
@@ -2272,87 +2548,211 @@ class DesktopPet(QWidget):
                             + random.choice([-1, 1]) * random.randint(60, 160)))
 
     def _pick_idle_transition(self, cursor_dx, cursor_dist, force=False):
+        """Decide what to do next, in character.
+
+        The repertoire, weights and habits come from pet_personality: a cat
+        and a shiba (and a ghost, and two robots) want different things, and
+        none of them does the same thing twice in a row.
+        """
         mood = self.mood()
         focusing = self.in_focus()
 
         # A tired pet sleeps, and a sleeping pet does not get excited.
         if self.energy < 15 or (mood == "sleepy" and random.random() < 0.35):
-            self._enter_state("SLEEP")
-            self.sounds.play("yawn", ambient=True)
-            return
-
-        # A happy pet with energy to spare sometimes breaks into a dance.
-        if mood == "happy" and self.energy > 50 and not focusing \
-                and random.random() < DANCE_CHANCE * 4:
-            self._start_dance(user=False)
-            return
-        if not focusing and self.energy > 60 and random.random() < DANCE_CHANCE:
-            self._start_dance(user=False)
-            return
-
-        roll = random.random()
-        threshold = 0.0
-
-        threshold += 0.05
-        if roll < threshold:
-            self._enter_state("BLINK")
-            return
-
-        threshold += 0.08
-        if roll < threshold:
-            self._enter_state("GROOM")
-            return
-
-        threshold += 0.12
-        if roll < threshold:
-            target = self._walk_target()
-            if target is not None:
-                self.target_x = target
-                self._enter_state("WALK")
+            if self.profile.get("air") and "charge" in self.profile["air"] \
+                    and self.energy < 40 and random.random() < 0.5:
+                self._run_action("charge", cursor_dx, cursor_dist)
                 return
+            self._run_action("nap", cursor_dx, cursor_dist)
+            return
 
-        # Chasing and stalking are the energetic options: skip them when the
-        # pet is worn out, and skip all of them during a focus block.
-        energetic = (not focusing and mood != "sleepy"
-                     and self.energy > MOOD_SLEEPY_MAX)
+        if self.flies:
+            context = "air"
+        elif self._is_on_ledge():
+            context = "ledge"
+        else:
+            context = "floor"
+        tired = mood == "sleepy" or self.energy <= MOOD_SLEEPY_MAX
 
-        threshold += 0.06
-        if roll < threshold and energetic and 40 < cursor_dist < 300:
-            if self.allow_chase and self.is_ghost:
-                self._enter_state("CHASE")
-            elif self.is_ghost:
-                self._enter_state("RUN")
-            elif self.allow_chase and self.energy > 55:
-                self._enter_state("CHASE")
+        queued, self._next_action = self._next_action, None
+        tried = set()
+        for attempt in range(4):
+            if queued and attempt == 0:
+                action = queued
             else:
-                self._enter_state("STALK")
-            return
-
-        threshold += 0.05
-        if roll < threshold and energetic and self.climb_enabled and not self.is_ghost:
-            if self._try_start_climb():
-                return
-
-        # A small hop, mostly for pets that have energy to burn. Ghosts hover;
-        # they have nothing to push off with.
-        threshold += 0.04
-        if roll < threshold and energetic and self.allow_jump and not self.is_ghost \
-                and self.state_timer > 20 and not self._is_on_ledge():
-            self._start_jump()
-            return
-
-        # Exploring: pick a window and go sit on it. This is what stops the pet
-        # from living on the taskbar for the whole session.
-        threshold += 0.26
-        if roll < threshold and not focusing:
-            if self._start_exploring():
+                action = self.chooser.pick(
+                    self.current_skin, context, tired=tired,
+                    focusing=focusing, energy=self.energy,
+                    allowed=lambda a: a not in tried and self._action_allowed(a),
+                    can_explore=self._explore_ready())
+            if action is None:
+                break
+            tried.add(action)
+            if self._run_action(action, cursor_dx, cursor_dist):
+                self.chooser.remember(action)
                 return
 
         if force:
+            if context == "air":
+                self._run_action("drift", cursor_dx, cursor_dist)
+                return
             target = self._walk_target()
             if target is not None:
                 self.target_x = target
                 self._enter_state("WALK")
+
+    def _action_allowed(self, action):
+        flag = persona.NEEDS.get(action)
+        return flag is None or bool(getattr(self, flag, True))
+
+    def _explore_ready(self):
+        cooldown = self.profile.get("explore_cooldown")
+        if cooldown is None:
+            return False
+        return (self.tick_count - self._last_explore_tick
+                >= cooldown * TICKS_PER_SECOND)
+
+    def _face_cursor(self, cursor_dx):
+        if abs(cursor_dx) > STEER_DEADZONE:
+            self.facing = 1 if cursor_dx > 0 else -1
+
+    def _fly_band(self):
+        top_f, bottom_f = FLY_BAND.get(self.current_skin, (0.3, 1.0))
+        low = self.floor_y - 6.0
+        top = self.screen_top + self.screen_h * top_f
+        return max(float(self.screen_top), min(top, low)), low
+
+    def _start_fly(self, x, y):
+        low = float(self.screen_left)
+        high = float(self.screen_left + self.screen_w - self.sprite_w)
+        top, bottom = self._fly_band()
+        self._fly_x = max(low, min(high, float(x)))
+        self._fly_y = max(top, min(bottom, float(y)))
+        self.facing = 1 if self._fly_x >= self.x_pos else -1
+        self._enter_state("FLY")
+
+    def _run_action(self, action, cursor_dx, cursor_dist):
+        """Start one personality action. True if something started."""
+        cursor = self._cursor
+        heavy = self.profile.get("heavy")
+        if action == "blink":
+            self._enter_state("BLINK")
+        elif action in ("stare", "loaf"):
+            if action == "stare":
+                self._face_cursor(cursor_dx)
+            on_ledge = self._is_on_ledge()
+            self._enter_state("IDLE" if action == "stare" or self.is_ghost
+                              else "SIT")
+            if not on_ledge and not self.flies:
+                self.y_pos = self.floor_y
+        elif action in ("groom", "scan"):
+            self._enter_state("GROOM")
+        elif action in ("wander", "march"):
+            target = self._walk_target()
+            if target is None:
+                return False
+            self.target_x = target
+            self._enter_state("WALK")
+        elif action == "stalk":
+            if not 45 < cursor_dist < 420:
+                return False
+            self._face_cursor(cursor_dx)
+            self._enter_state("STALK")
+        elif action == "chase":
+            if not 45 < cursor_dist < 360:
+                return False
+            self._enter_state("CHASE")
+        elif action in ("hop", "stomp"):
+            if self._is_on_ledge():
+                return False
+            self._heavy_landing = action == "stomp" or bool(heavy)
+            self._start_jump()
+        elif action == "climb":
+            if self._is_on_ledge() or not self._try_start_climb():
+                return False
+            self._last_explore_tick = self.tick_count
+        elif action == "explore":
+            if not self._start_exploring():
+                return False
+            self._last_explore_tick = self.tick_count
+        elif action == "go_down":
+            if not self._is_on_ledge():
+                return False
+            if self.allow_jump and self.energy > 40:
+                self._start_jump()
+            else:
+                self._leave_ledge()
+        elif action == "nap":
+            if self.profile.get("nap_spin") and not self._is_on_ledge():
+                self._enter_state("SPIN")      # round and round, then down
+            else:
+                self._enter_state("SLEEP")
+                self.sounds.play("yawn", ambient=True)
+        elif action == "zoomies":
+            if self._is_on_ledge():
+                return False
+            self._zoom_laps = random.randint(2, 4)
+            self.facing = random.choice((-1, 1))
+            self._enter_state("ZOOMIES")
+            follow_up = (self.profile.get("after") or {}).get("zoomies")
+            self._next_action = follow_up
+        elif action == "dance":
+            self._start_dance(user=False)
+            return self.state == "DANCE"
+        elif action == "follow":
+            if cursor_dist < 90:
+                return False
+            self._enter_state("FOLLOW")
+        elif action == "sniff":
+            self.facing = random.choice((-1, 1))
+            self._enter_state("SNIFF")
+        elif action == "beg":
+            if cursor_dist > 400:
+                return False
+            self._face_cursor(cursor_dx)
+            self._start_one_shot("HAPPY")
+        elif action in ("bark", "beep", "surge"):
+            self._face_cursor(cursor_dx)
+            if not self._start_one_shot("ALERT"):
+                return False
+            self._emit_fx("sparks" if action == "surge" else "exclaim")
+            cue = {"bark": "bark", "beep": "beep", "surge": "menace"}[action]
+            self.sounds.play(cue, ambient=True)
+        elif action == "glare":
+            self._face_cursor(cursor_dx)
+            if not self._start_one_shot("SULK"):
+                return False
+        elif action == "charge":
+            if not self._start_one_shot("EAT"):
+                return False
+            self.energy = min(100.0, self.energy + 30.0)
+        elif action == "wave":
+            self._face_cursor(cursor_dx)
+            self._start_one_shot("PAT")
+        elif action == "drift":
+            top, bottom = self._fly_band()
+            x = self.x_pos + random.choice((-1, 1)) * random.uniform(120, 420)
+            y = random.uniform(top, bottom)
+            # mostly cruise low; now and then go somewhere high
+            if random.random() < 0.55:
+                y = random.uniform(bottom - self.screen_h * 0.2, bottom)
+            self._start_fly(x, y)
+        elif action == "patrol":
+            x = self.x_pos + random.choice((-1, 1)) * random.uniform(200, 600)
+            self._start_fly(x, self.ghost_hover_y)
+        elif action == "assist":
+            side = -1 if cursor.x() > self.x_pos + self.sprite_w / 2 else 1
+            self._start_fly(cursor.x() + side * 70 - self.sprite_w / 2,
+                            cursor.y() - self.sprite_h)
+        elif action == "haunt":
+            if cursor_dist > 700:
+                return False
+            self._enter_state("HAUNT")
+        elif action == "phase":
+            self._enter_state("PHASE")
+        else:
+            return False
+        return True
 
     # ---- LEAP ----------------------------------------------------------
     #
@@ -2628,8 +3028,8 @@ class DesktopPet(QWidget):
         if toward is not None:
             self.facing = 1 if toward >= self.x_pos else -1
         self.vy = -JUMP_VELOCITY
-        if self.is_ghost:
-            # A ghost has no legs to push off with; it just rises and settles.
+        if self.flies:
+            # A flyer has no legs to push off with; it just rises and settles.
             self.ghost_hover_y = self.y_pos - 40.0
 
     def _tick_jump(self):
@@ -2644,19 +3044,23 @@ class DesktopPet(QWidget):
     def _tick_chase(self, cursor_dx, cursor_dist):
         """Sprint after the cursor, then pounce when close enough."""
         laser = bool(self._laser_until)
-        if cursor_dx != 0:
-            self.facing = 1 if cursor_dx > 0 else -1
-        # the laser game is a sprint, and it stops dead under the dot
-        if laser and abs(cursor_dx) < 6:
-            return
-        self.x_pos += self.facing * (CHASE_SPEED * 1.35 if laser else CHASE_SPEED)
+        speed = CHASE_SPEED * 1.35 if laser else CHASE_SPEED
+        moving = self._steer(cursor_dx, speed)
         if self._clamp_to_ledge():
             self._enter_sit()
             return
-        if cursor_dist < 40:
+        above_head = self._cursor.y() - self.y_pos
+        reachable = -POUNCE_REACH_PX < above_head < self.sprite_h
+        if cursor_dist < 40 or (not moving and reachable and self.allow_jump):
+            # close, or straight overhead within a hop: spring at it
             self._start_jump(toward=self.x_pos + self.facing * 10)
             self._enter_state("POUNCE")
             self.sounds.play("pounce", ambient=not laser)
+            return
+        if not moving:
+            # right under it and it is out of reach: sit and stare up at it
+            # instead of running on the spot
+            self._enter_state("IDLE")
             return
         if not laser and (cursor_dist > 420 or self.state_timer > 220):
             self._enter_state("SIT")
@@ -2673,23 +3077,42 @@ class DesktopPet(QWidget):
         """The airborne half of a pounce: same arc as JUMP."""
         self._tick_jump()
 
+    def _steer(self, cursor_dx, speed):
+        """Move toward the cursor without overshooting it.
+
+        Returns False once the pet is lined up with the cursor (within
+        STEER_DEADZONE). Turning only outside the dead zone, and never
+        stepping past the target, is what stops the pet from flipping left
+        and right every tick while running in place under a cursor it
+        cannot reach.
+        """
+        if abs(cursor_dx) <= STEER_DEADZONE:
+            return False
+        self.facing = 1 if cursor_dx > 0 else -1
+        self.x_pos += self.facing * min(speed, abs(cursor_dx) - STEER_DEADZONE / 2.0)
+        return True
+
     def _tick_stalk(self, cursor_dx, cursor_dist):
-        if cursor_dx != 0:
-            self.facing = 1 if cursor_dx > 0 else -1
-        self.x_pos += self.facing * 1.6
+        moving = self._steer(cursor_dx, 1.6)
         # Same ledge clamp as WALK; without it the pet strolls off the
         # titlebar and then floats there forever.
         if self._clamp_to_ledge() or cursor_dist < 45:
             self._enter_state("SWAT")
             return
+        if not moving:
+            # lined up but out of reach (the cursor is overhead): bat at it if
+            # it is close, otherwise sit and watch it
+            if cursor_dist < 120:
+                self._enter_state("SWAT")
+            else:
+                self._enter_state("IDLE")
+            return
         if self.state_timer > STATE_MAX_DURATION.get("STALK", 120):
             self._enter_state("SWAT")
 
     def _tick_run(self, cursor_dx, cursor_dist):
-        if cursor_dx != 0:
-            self.facing = 1 if cursor_dx > 0 else -1
-        self.x_pos += self.facing * (2.2 if self.is_ghost else 3.2)
-        if self._clamp_to_ledge() or cursor_dist < 50:
+        moving = self._steer(cursor_dx, 2.2 if self.is_ghost else 3.2)
+        if self._clamp_to_ledge() or cursor_dist < 50 or not moving:
             self._enter_state("SWAT")
             return
         if self.state_timer > STATE_MAX_DURATION.get("RUN", 90):
@@ -2705,7 +3128,8 @@ class DesktopPet(QWidget):
         chasing = self.goal_ledge is not None
         dx = self.target_x - self.x_pos
         self.facing = 1 if dx >= 0 else -1
-        self.x_pos += self.facing * (LEAP_GOAL_SPEED if chasing else 1.1)
+        self.x_pos += self.facing * (LEAP_GOAL_SPEED if chasing else
+                                     float(self.profile.get("walk_speed", 1.1)))
 
         if self._clamp_to_ledge():
             self.goal_ledge = None
@@ -2773,8 +3197,12 @@ class DesktopPet(QWidget):
             event = self.land_event or ("drop" if announce else None)
             self.land_event = None
             if impact > 4.0:
-                self._emit_fx("dust")
+                heavy = self._heavy_landing or self.profile.get("heavy")
+                self._emit_fx("thud" if heavy else "dust")
                 self._squash_ticks = LAND_SQUASH_TICKS
+                if self._heavy_landing:
+                    self.sounds.play("land", ambient=True)
+            self._heavy_landing = False
             if event == "fling" or self._user_drop:
                 self.sounds.play("land")
             self._user_drop = False
@@ -2902,30 +3330,12 @@ class DesktopPet(QWidget):
             self._leave_ledge()
             return
 
-        roll = random.random()
-
-        # Hop to another window. This is what turns 'sits on one titlebar'
-        # into 'moves around the desktop': from a perch, leaving was the only
-        # other option, so the pet dropped to the floor and climbed straight
-        # back up to the window it had just left.
-        if roll < 0.30 and self._start_exploring():
-            return
-
-        if roll < 0.10:
-            span = ledge.x_max - ledge.x_min - self.sprite_w
-            if span > 20:
-                self.target_x = random.uniform(ledge.x_min, ledge.x_max - self.sprite_w)
-                self._enter_state("WALK")
-                return
-
-        # Hopping off, all the way down. The roll above prefers travelling to
-        # another window, but a pet that never comes down still looks stuck up
-        # there, so this stays common on purpose.
-        if roll < 0.55:
-            if self.allow_jump and self.energy > 40:
-                self._start_jump()
-            else:
-                self._leave_ledge()
+        # Landed: now live up here for a while, in character (groom, stare,
+        # nap, wander the titlebar...). Leaving is just one of the options,
+        # which is what stops the floor-to-ceiling ping-pong.
+        self._pick_idle_transition(cursor_dx, cursor_dist)
+        if self.state == "PERCH":
+            self._enter_state("SIT")
 
     def _leave_ledge(self):
         self.current_ledge = None
@@ -2958,7 +3368,7 @@ class DesktopPet(QWidget):
 
         frame = self.get_current_frame()
         sprite_y = self._sprite_offset()
-        if frame is not None:
+        if frame is not None and not self.phased_out():
             painter.drawPixmap(0, sprite_y, frame)
 
         # Without the particle overlay, fall back to the static heart.
@@ -3158,10 +3568,22 @@ class DesktopPet(QWidget):
                 self._speak_contextual("grumpy")
                 return
             self.heart_timer = 20
-            if event_type == "pet_spam":
+            if event_type == "pet_spam" and self.profile.get("aloof") \
+                    and not self.flies and random.random() < 0.5:
+                # a cat has had enough, thank you: it walks off
+                self._enter_sit()
+                cx = self._cursor.x()
+                away = -1 if cx > self.x_pos + self.sprite_w / 2.0 else 1
+                low = float(self.screen_left)
+                high = float(self.screen_left + self.screen_w - self.sprite_w)
+                self.target_x = max(low, min(high, self.x_pos + away * 220))
+                self._enter_state("WALK")
+                self._emit_fx("anger")
+            elif event_type == "pet_spam":
                 self._enter_sit()
                 self._start_one_shot("HAPPY")
-                self.sounds.play("happy")
+                self.sounds.play("bark" if self.current_skin == "shiba"
+                                 else "happy")
             else:
                 self._enter_sit()
                 self._start_one_shot("PETTED")
@@ -3182,7 +3604,7 @@ class DesktopPet(QWidget):
         self._refresh_screen_geometry()
 
         self._mark_user_moment()
-        if self.is_ghost:
+        if self.flies:
             # Resume hovering from wherever it was released, then ease back
             # down. The old code assigned y_pos and then immediately
             # overwrote it with the floor value, so it snapped instead.
@@ -3244,6 +3666,9 @@ class DesktopPet(QWidget):
         # still on screen, so the model would describe the pet's own menu.
         # _menu_look only sets the flag; the capture waits for the menu to go.
         menu.exec_(event.globalPos())
+        # Built fresh on every right-click with the pet as parent: without
+        # this every menu (and its submenus) stayed alive until exit.
+        menu.deleteLater()
         if self._pending_capture:
             self._pending_capture = False
             QTimer.singleShot(MENU_CLOSE_DELAY_MS, self._run_pending_capture)
@@ -3627,9 +4052,9 @@ class DesktopPet(QWidget):
 
     def _menu_laser(self):
         self._mark_user_moment()
-        if self.is_ghost:
-            # ghosts drift after it instead of sprinting
-            self._enter_state("CHASE")
+        if self.flies:
+            # flyers glide after it instead of sprinting
+            self._enter_state("HAUNT")
         self._laser_until = self.tick_count + int(LASER_SECONDS * TICKS_PER_SECOND)
         self.sounds.play("alert")
         self._speak_contextual("laser")
@@ -3662,9 +4087,7 @@ class DesktopPet(QWidget):
     def _apply_click_through(self):
         """Keep the window flag in sync with `self.click_through`."""
         try:
-            flags = (Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
-            if self.click_through:
-                flags |= Qt.WindowTransparentForInput
+            flags = window_flags(self.click_through)
             if self.windowFlags() != flags:
                 self.setWindowFlags(flags)
                 self.show()

@@ -171,6 +171,9 @@ def _default_config():
             "allow_chase": True,
             "ai_context_lines": True,
             "hide_on_fullscreen": True,
+            # "strong": an unmanaged X11 window that stays above everything,
+            # fullscreen windows included. "normal": a regular on-top window.
+            "always_on_top": "strong",
             "sleep_when_idle_seconds": 300,
             "quiet_hours": {"enabled": False, "start": "23:00", "end": "07:00"},
         },

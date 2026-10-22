@@ -77,7 +77,10 @@ open:
 - `state` — saved session, including `energy_decay_per_hour`.
 - `behaviour` — `ignore_windows`, `allow_jump`, `allow_chase`,
   `ai_context_lines`, `hide_on_fullscreen`, `sleep_when_idle_seconds`,
-  `quiet_hours` (see **Keeping out of the way** below).
+  `quiet_hours` (see **Keeping out of the way** below), and
+  `always_on_top`: `"strong"` (default) makes the pet an unmanaged X11
+  window that stays above everything, fullscreen video included; `"normal"`
+  is a regular always-on-top window that fullscreen apps can cover.
 
 Secrets (`MODEL`, API keys) stay in `.env`. Everything else is in the JSON so
 you're not hunting through code to change a personality or a rate limit.
@@ -380,6 +383,33 @@ your timer stopped — the session is treated as over rather than ignored.
   it) and complains about it. A slow release is still a placement, not a
   throw. Cross-monitor drags re-seat the pet on the screen it was released on
   before the arc decides where the floor is.
+
+## Personalities
+
+Each companion has its own repertoire (`pet_personality.py`), so they behave
+like what they are rather than five skins on one NPC:
+
+- **Cat**: aloof. Stares at you, grooms, loafs, stalks the cursor and
+  pounces, naps anywhere (up on a window by preference), climbs, gets the
+  zoomies and then sits down and grooms as if nothing happened. Pet it too
+  much and it walks off.
+- **Shiba**: your shadow. Trots over to wherever your cursor is and sits
+  looking up, sniffs along the floor, begs, barks, zoomies, spins in a circle
+  before lying down. Dogs do not climb: it stays on the floor, and hops down
+  if you put it on a window.
+- **Ghost**: no floor. Drifts anywhere on screen, haunts the cursor from a
+  polite distance, phases out in a puff and reappears somewhere else, and
+  spooks you if the cursor creeps up on it.
+- **Jarvis**: a butler drone. Cruises and patrols at hover height, floats over
+  beside your cursor to "assist", scans, docks to recharge when low.
+- **Ultron**: heavy and theatrical. Marches (every step kicks up dust), glares
+  at the cursor, stalks it, scales windows and surveys from the top, power
+  surges, stomps.
+
+Picks are weighted per companion and remembered: the same action never
+happens twice in a row, and anything done recently is strongly discounted.
+Climbing up to a window has a cooldown (2.5 minutes for the cat), and once up
+there the pet settles in for a while instead of bouncing straight back down.
 
 ## Reactions
 

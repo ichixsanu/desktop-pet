@@ -1660,7 +1660,7 @@ class TestLongRunInvariants(PetHarness):
                     delta=2.0, msg="perched but not on the ledge")
             if self.pet.state in ("SIT", "IDLE", "WALK", "STALK", "RUN", "CHASE",
                                   "SWAT", "BLINK", "GROOM", "SLEEP", "SWAT"):
-                if not self.pet._is_on_ledge() and not self.pet.is_ghost:
+                if not self.pet._is_on_ledge() and not self.pet.flies:
                     self.assertAlmostEqual(
                         self.pet.y_pos, self.pet.floor_y, delta=12.0,
                         msg="%s floating at %.1f" % (self.pet.state, self.pet.y_pos))
@@ -2618,9 +2618,20 @@ class TestReactions(PetHarness):
         self.pet._enter_sit()
         with patch.object(self.pet.interaction, "record_pet",
                           return_value="pet_spam"):
-            self.pet.mousePressEvent(_click())
-            self.pet.mouseReleaseEvent(_click())
+            with patch.object(P.random, "random", return_value=0.9):
+                self.pet.mousePressEvent(_click())
+                self.pet.mouseReleaseEvent(_click())
         self.assertEqual(self.pet.state, "HAPPY")
+
+    def test_an_over_petted_cat_walks_off(self):
+        self.pet.load_skin("cat")
+        self.pet._enter_sit()
+        with patch.object(self.pet.interaction, "record_pet",
+                          return_value="pet_spam"):
+            with patch.object(P.random, "random", return_value=0.0):
+                self.pet.mousePressEvent(_click())
+                self.pet.mouseReleaseEvent(_click())
+        self.assertEqual(self.pet.state, "WALK")
 
     def test_poking_a_sleeping_pet_makes_it_sulk(self):
         self.pet._enter_state("SLEEP")
@@ -2697,12 +2708,174 @@ class TestReactions(PetHarness):
         self.pet._ambient_flourish(near, P.ALERT_SPEED_PX + 5)
         self.assertEqual(self.pet.state, "SIT")
 
-    def test_dancing_is_a_rare_idle_choice(self):
+    def test_ghost_spooks_when_the_cursor_creeps_up(self):
+        self.pet.load_skin("ghost")
         self.pet._enter_sit()
-        self.pet.energy = 90.0
-        with patch.object(P.random, "random", return_value=0.0):
-            self.pet._pick_idle_transition(0, 500)
-        self.assertEqual(self.pet.state, "DANCE")
+        here = QPoint(int(self.pet.x_pos + self.pet.sprite_w / 2),
+                      int(self.pet.y_pos + self.pet.sprite_h / 2))
+        self.pet._ambient_flourish(here, 0)
+        self.assertEqual(self.pet.state, "SPOOK")
+
+
+class TestPersonality(PetHarness):
+    """Each companion behaves like itself, and never like an NPC loop."""
+
+    def pick_many(self, skin, n=300, energy=90.0):
+        self.pet.load_skin(skin)
+        self.apply_screen()
+        seen = {}
+        last = None
+        for _ in range(n):
+            self.pet.energy = energy
+            self.pet.current_ledge = None
+            self.pet.x_pos = 600.0
+            self.pet.y_pos = self.pet.floor_y
+            self.pet._enter_sit()
+            self.pet._pick_idle_transition(200, 250)
+            action = self.pet.chooser.recent[-1] if self.pet.chooser.recent else None
+            if action is not None and action == last:
+                self.fail("%s repeated %s back to back" % (skin, action))
+            last = action
+            seen[self.pet.state] = seen.get(self.pet.state, 0) + 1
+        return seen
+
+    def test_companions_have_different_repertoires(self):
+        cat = self.pick_many("cat")
+        shiba = self.pick_many("shiba")
+        ghost = self.pick_many("ghost")
+        self.assertIn("GROOM", cat)
+        self.assertNotIn("FOLLOW", cat)
+        self.assertIn("FOLLOW", shiba)
+        self.assertIn("SNIFF", shiba)
+        self.assertNotIn("CLIMB", shiba)
+        self.assertIn("FLY", ghost)
+        self.assertNotIn("WALK", ghost)
+
+    def test_shiba_never_leaves_the_floor_on_its_own(self):
+        seen = self.pick_many("shiba")
+        for state in ("CLIMB", "LEAP"):
+            self.assertNotIn(state, seen)
+
+    def test_exploring_has_a_cooldown(self):
+        self.pet.load_skin("cat")
+        self.pet._last_explore_tick = self.pet.tick_count
+        self.assertFalse(self.pet._explore_ready())
+        self.pet.tick_count += int(self.pet.profile["explore_cooldown"]
+                                   * P.TICKS_PER_SECOND) + 1
+        self.assertTrue(self.pet._explore_ready())
+
+    def test_a_perched_pet_settles_in_instead_of_bouncing_off(self):
+        self.assertEqual(self.land(200, 50), "PERCH")
+        stayed = 0
+        for _ in range(60):
+            self.land(200, 50)
+            self.pet._enter_state("PERCH")
+            self.pet.state_timer = P.STATE_MIN_DURATION["PERCH"]
+            self.pet._tick_perch(0, 500)
+            if self.pet._is_on_ledge():
+                stayed += 1
+        self.assertGreater(stayed, 40, "it should mostly stay up there")
+
+    def test_flyers_hover_where_they_are_dropped(self):
+        self.pet.load_skin("jarvis")
+        self.apply_screen()
+        self.assertTrue(self.pet.flies)
+        self.pet.mousePressEvent(_click())
+        self.pet.dragging = True
+        self.pet.y_pos = 150.0
+        self.pet.mouseReleaseEvent(_click())
+        self.assertNotEqual(self.pet.state, "FALL")
+
+    def test_drift_flies_somewhere_and_settles(self):
+        self.pet.load_skin("ghost")
+        self.apply_screen()
+        self.pet._start_fly(self.pet.x_pos + 200, self.pet.floor_y - 200)
+        for _ in range(P.FLY_MAX_TICKS + 5):
+            self.pet._update_fsm(QPoint(0, 0))
+            if self.pet.state != "FLY":
+                break
+        self.assertIn(self.pet.state, ("IDLE", "SIT"))
+
+    def test_phasing_hides_then_reappears(self):
+        self.pet.load_skin("ghost")
+        self.apply_screen()
+        self.pet._enter_state("PHASE")
+        seen_hidden = False
+        for _ in range(P.PHASE_TICKS + 2):
+            self.pet._update_fsm(QPoint(0, 0))
+            seen_hidden = seen_hidden or self.pet.phased_out()
+        self.assertTrue(seen_hidden)
+        self.assertFalse(self.pet.phased_out())
+
+    def test_zoomies_end_in_a_groom_for_the_cat(self):
+        self.pet.load_skin("cat")
+        self.apply_screen()
+        self.pet._enter_sit()
+        self.assertTrue(self.pet._run_action("zoomies", 0, 500))
+        for _ in range(500):
+            self.pet._update_fsm(QPoint(0, 0))
+            if self.pet.state != "ZOOMIES":
+                break
+        self.assertEqual(self.pet._next_action, "groom")
+
+
+class TestNoJitter(PetHarness):
+    """Running in place while flipping left/right every tick, under a
+    cursor it cannot reach, was a real bug."""
+
+    def overhead(self, height):
+        return QPoint(int(self.pet.x_pos + self.pet.sprite_w / 2 + 3),
+                      int(self.pet.y_pos - height))
+
+    def count_flips(self, state, cursor, ticks=120):
+        self.pet._enter_state(state)
+        flips, last = 0, self.pet.facing
+        for _ in range(ticks):
+            # the user's hand is never perfectly still
+            wobble = QPoint(cursor.x() + (1 if _ % 2 else -1) * 4, cursor.y())
+            self.pet._update_fsm(wobble)
+            if self.pet.facing != last:
+                flips += 1
+                last = self.pet.facing
+            if self.pet.state != state:
+                break
+        return flips
+
+    def test_chase_does_not_flip_flop_under_an_unreachable_cursor(self):
+        self.pet._enter_sit()
+        flips = self.count_flips("CHASE", self.overhead(400))
+        self.assertLessEqual(flips, 1)
+        self.assertNotEqual(self.pet.state, "CHASE",
+                            "it should give up and watch, not run on the spot")
+
+    def test_chase_pounces_at_a_cursor_just_overhead(self):
+        self.pet._enter_sit()
+        self.count_flips("CHASE", self.overhead(60), ticks=5)
+        self.assertIn(self.pet.state, ("POUNCE", "FALL", "SIT"))
+
+    def test_laser_waits_under_the_dot_instead_of_running(self):
+        self.pet._enter_sit()
+        self.pet._menu_laser()
+        cursor = self.overhead(400)
+        flips, last = 0, self.pet.facing
+        for i in range(120):
+            self.pet._update_fsm(QPoint(cursor.x() + (4 if i % 2 else -4),
+                                        cursor.y()))
+            if self.pet.facing != last:
+                flips += 1
+                last = self.pet.facing
+        self.assertLessEqual(flips, 1)
+        self.assertNotEqual(self.pet.state, "CHASE")
+
+    def test_stalk_does_not_flip_flop(self):
+        self.pet._enter_sit()
+        self.assertLessEqual(self.count_flips("STALK", self.overhead(400)), 1)
+
+    def test_haunt_keeps_its_side(self):
+        self.pet.load_skin("ghost")
+        self.apply_screen()
+        self.pet._enter_sit()
+        self.assertLessEqual(self.count_flips("HAUNT", self.overhead(300)), 1)
 
 
 class TestJuice(PetHarness):
